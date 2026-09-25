@@ -32,7 +32,7 @@ template
 | `f: T` | Required value. May also appear on the header line (`route-map {{ name }} {{ action }} {{ seq }}`). |
 | `f: T = default` | Required, with a default used when the line is absent; the line is omitted when rendering the default. |
 | `f: T?` | The line is optional. |
-| `f: flag` / `f: flag = true` | Presence of a literal line; `no <line>` is `false`. |
+| `f: flag` / `f: flag = true` | Presence of a literal line; `<negation> <line>` is `false`. Set the default to the device's default so negated lines render exactly when needed. A flag whose template literals start with the negation word (`no ip address {{ cleared }}`) is matched literally and only has that spelling. |
 | `f: [Model]` | A keyed collection; `{{ f }}` alone on a line stands for all of its blocks/lines. |
 | `type name = /regex/` | One-token type validated by a regex. |
 | `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
@@ -78,6 +78,18 @@ template
 
 Only two things are code: a new **grammar** (how text becomes a statement tree; `indent` and `braces` exist, `set`-style input would be a third) and a new **type implementation** with its own parsing logic (`Scalar` trait). Everything that merely varies per platform is a declaration.
 
+## Spellings and `null` (how `no` works)
+
+With `negation: no` declared in the dialect, every value line has a negated form that the template never needs to write:
+
+| Config | Data |
+|---|---|
+| nothing about the field | key missing |
+| `no ip address` | `address: null` |
+| `ip address 10.1.1.1/32` | `address: "10.1.1.1/32"` |
+
+Parsing `no <the line's literals>` yields `null` for an optional field (and the default for a defaulted one); `null` in intent data renders the negated form, which is also the command that clears the setting on the device. A missing key writes nothing. Flags follow the same idea with `true`/`false`: `no shutdown` is `false`, and a flag is written when its value differs from its declared default, so declare the *device's* default (`shutdown: flag = true` on platforms that shut interfaces by default). Writing `no shutdown {{ shutdown }}` in a template is allowed for readability and changes nothing. `netcfg explain` prints this table for any model, and the JSON Schema marks optional fields nullable when the dialect has a negation word.
+
 ## Matching rules
 
 Every line under a block the model owns ends up in exactly one place: **claimed** by the first template line that fully matches (template order); an **error** if it starts like a managed line (literals and key placeholders up to the first value placeholder match) but nothing fully matches, since silently leaving the field at its default would misrepresent the device; otherwise **unmanaged**, reported with its ancestors (`router bgp 65000 > neighbor 10.1.0.1 > bfd`). `@ignore` prefixes are checked first and always win. Headers are never strict: a `route-map` line whose sequence number doesn't decode is simply not one of ours.
@@ -89,6 +101,7 @@ cargo build --release
 netcfg validate templates/nxos
 netcfg parse   templates/nxos running.cfg --model Device --format yaml --unmanaged
 netcfg render  templates/nxos intent.yaml  --model Device
+netcfg explain templates/ios  --model Interface     # how each field is spelled: value, absent, true/false, defaults
 netcfg schema  templates/nxos --model Device        # JSON Schema for editor completion/validation
 netcfg bench   templates/nxos running.cfg --model Device --runs 5
 ```

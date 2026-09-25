@@ -97,7 +97,34 @@ pub fn shape(lines: &[TLine], keys: &[&str]) -> Result<Shape, String> {
 }
 
 /// `rest_of_line(type_spec)` tells whether a field's type consumes the rest of the line.
-pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_line: &dyn Fn(&FieldDef) -> bool) -> Vec<String> {
+/// A line that spells the *absence* of an optional field: `<negation> <literals> {{ field }}`
+/// where the same field is also bound by a normal value line. Its placeholder is the
+/// only one and is the last token; the literals after the negation word must match the
+/// value line's literal prefix.
+pub fn absent_spelling_of<'a>(l: &'a TLine, negation: Option<&str>, fields: &[FieldDef]) -> Option<&'a str> {
+    let neg = negation?;
+    match l.toks.as_slice() {
+        [Tok::Lit(first), .., Tok::Hole(h)] if first == neg && l.holes().len() == 1 && l.children.is_empty() => {
+            fields.iter().find(|f| &f.name == h && f.kind == Kind::Opt).map(|_| h.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// A flag's negated spelling written out explicitly (`no shutdown {{ shutdown }}` next to
+/// `shutdown {{ shutdown }}`). It is implied by the dialect anyway; writing it is allowed so
+/// the template can show both spellings.
+pub fn negated_flag_line<'a>(l: &'a TLine, negation: Option<&str>, fields: &[FieldDef]) -> Option<&'a str> {
+    let neg = negation?;
+    match l.toks.as_slice() {
+        [Tok::Lit(first), .., Tok::Hole(h)] if first == neg && l.holes().len() == 1 && l.children.is_empty() && l.toks.len() > 2 => {
+            fields.iter().find(|f| &f.name == h && f.kind == Kind::Flag).map(|_| h.as_str())
+        }
+        _ => None,
+    }
+}
+
+pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_line: &dyn Fn(&FieldDef) -> bool, negation: Option<&str>) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
     let by_name = |n: &str| fields.iter().find(|f| f.name == n);
     let keys: Vec<&str> = fields.iter().filter(|f| f.kind == Kind::Key).map(|f| f.name.as_str()).collect();
@@ -114,10 +141,29 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
             }
         }
     }
-    let bound: Vec<&str> = every.iter().flat_map(|l| l.holes()).collect();
+    // Absent-spelling lines and explicit negated flag lines are checked separately and don't count as bindings.
+    let absent_lines: Vec<&TLine> = every.iter().copied().filter(|l| absent_spelling_of(l, negation, fields).is_some() || negated_flag_line(l, negation, fields).is_some()).collect();
+    let bound: Vec<&str> = every.iter().filter(|l| !absent_lines.iter().any(|a| std::ptr::eq(*a, **l))).flat_map(|l| l.holes()).collect();
     for f in fields {
         if !bound.contains(&f.name.as_str()) && f.default.is_none() {
             errs.push(format!("field `{}` is not bound in the template and has no default value", f.name));
+        }
+    }
+    for a in &absent_lines {
+        if let Some(h) = absent_spelling_of(a, negation, fields) {
+            err(&mut errs, a, format!("the negated form of a value line is implied by the dialect's negation word: parsing `{} …` sets `{h}` to null, and null in the data renders it; remove this line", negation.unwrap_or("no")));
+            continue;
+        }
+        let h = negated_flag_line(a, negation, fields).unwrap();
+        let value_line = every.iter().find(|l| !std::ptr::eq(**l, *a) && l.holes() == vec![h] && !absent_lines.iter().any(|x| std::ptr::eq(*x, **l)));
+        let what = if negated_flag_line(a, negation, fields).is_some() { "negated flag spelling" } else { "absent spelling" };
+        match value_line {
+            None => err(&mut errs, a, format!("`{h}` needs a normal line for this {what} to pair with")),
+            Some(v) => {
+                let a_lits: Vec<&Tok> = a.toks[1..a.toks.len() - 1].iter().collect();
+                let v_lits: Vec<&Tok> = v.toks.iter().take_while(|t| matches!(t, Tok::Lit(_))).collect();
+                if a_lits != v_lits { err(&mut errs, a, format!("{what} must be `{} <the other line's literals> {{{{ {h} }}}}`", negation.unwrap_or("no"))); }
+            }
         }
     }
     let mut seen: Vec<&str> = Vec::new();
@@ -182,6 +228,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
         }
         Ok(Shape::Flat { lines: flat, .. }) => {
             for l in &flat {
+                if absent_spelling_of(l, negation, fields).is_some() || negated_flag_line(l, negation, fields).is_some() { err(&mut errs, l, "negated spellings are not supported in flat groups yet".into()); continue; }
                 let ks: Vec<&str> = l.holes().into_iter().filter(|h| keys.contains(h)).collect();
                 if ks != keys { err(&mut errs, l, format!("every line of a flat group must carry all Key fields in the same order ({})", keys.join(", "))); }
                 let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));

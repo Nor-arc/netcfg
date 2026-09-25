@@ -23,11 +23,16 @@ impl<'a> Node<'a> {
 pub struct OwnedNode {
     pub tokens: Vec<String>,
     pub children: Vec<OwnedNode>,
+    /// Rendered from a block model (so IOS-style separators apply even when empty).
+    pub block: bool,
 }
 
 impl OwnedNode {
     pub fn leaf(tokens: Vec<String>) -> Self {
-        OwnedNode { tokens, children: Vec::new() }
+        OwnedNode { tokens, children: Vec::new(), block: false }
+    }
+    pub fn with_children(tokens: Vec<String>, children: Vec<OwnedNode>) -> Self {
+        OwnedNode { tokens, children, block: true }
     }
     pub fn line(&self) -> String {
         self.tokens.join(" ")
@@ -36,6 +41,7 @@ impl OwnedNode {
         OwnedNode {
             tokens: n.tokens.iter().map(|t| t.to_string()).collect(),
             children: n.children.iter().map(OwnedNode::from_node).collect(),
+            block: !n.children.is_empty(),
         }
     }
     /// Every leaf path, e.g. `router bgp 65000 > neighbor 10.0.0.1 > bfd`.

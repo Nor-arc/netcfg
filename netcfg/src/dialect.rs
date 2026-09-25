@@ -145,7 +145,7 @@ impl Dialect {
                 }
                 for n in nodes {
                     go(self, n, 0, &mut out);
-                    if let (Some(sep), false) = (&self.block_separator, n.children.is_empty()) { out.push_str(sep); out.push('\n'); }
+                    if let (Some(sep), true) = (&self.block_separator, n.block || !n.children.is_empty()) { out.push_str(sep); out.push('\n'); }
                 }
                 if let Some(end) = &self.end_marker { out.push_str(end); out.push('\n'); }
             }
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn braces_render_both_styles() {
-        let n = vec![OwnedNode { tokens: vec!["system".into()], children: vec![OwnedNode::leaf(vec!["host-name".into(), "r1".into()]), OwnedNode::leaf(vec!["description".into(), "to core".into()])] }];
+        let n = vec![OwnedNode::with_children(vec!["system".into()], vec![OwnedNode::leaf(vec!["host-name".into(), "r1".into()]), OwnedNode::leaf(vec!["description".into(), "to core".into()])])];
         let mut d = Dialect::builtin("junos").unwrap();
         assert_eq!(d.render(&n), "system {\n    host-name r1;\n    description \"to core\";\n}\n");
         d.render_set = true;

@@ -226,7 +226,7 @@ fn union_and_list_types() {
     assert!(err.0.contains("not a valid prependItem"), "{err}");
     // schema
     let sch = s.e.schema("Device").unwrap();
-    assert_eq!(sch["$defs"]["RouteMapEntry"]["properties"]["prependAsPath"]["items"]["anyOf"][1]["enum"], serde_json::json!(["auto"]));
+    assert_eq!(sch["$defs"]["RouteMapEntry"]["properties"]["prependAsPath"]["anyOf"][0]["items"]["anyOf"][1]["enum"], serde_json::json!(["auto"]));
     // a bare unknown word in a union is an error, with a hint
     let err = Engine::from_text("t", "type x = asn | auto\nmodel M\n  a: x\n\ntemplate\n  a {{ a }}\n", Some("nxos")).unwrap_err();
     assert!(err.0.contains("unknown type `auto`") && err.0.contains("quote it"), "{err}");
@@ -286,7 +286,7 @@ fn struct_types() {
     v["bgp"][0]["neighbors"][0]["maximumRoutes"] = serde_json::json!({"action": "warning-only"});
     assert!(s.e.render("EosDevice", &Value::from_json(&v)).unwrap_err().0.contains("field `limit` is missing"));
     let sch = s.e.schema("EosDevice").unwrap();
-    assert_eq!(sch["$defs"]["EosNeighbor"]["properties"]["maximumRoutes"]["required"], serde_json::json!(["limit"]));
+    assert_eq!(sch["$defs"]["EosNeighbor"]["properties"]["maximumRoutes"]["anyOf"][0]["required"], serde_json::json!(["limit"]));
 
     // NX-OS: optional middle parts.
     let n = Suite::new("nxos", "Device", NX);
@@ -298,4 +298,87 @@ fn struct_types() {
     n.parses_to(&add("1000 80 restart 5"), |j| mp(j) == serde_json::json!({"limit": 1000, "threshold": 80, "action": "restart", "restart": 5}));
     n.fails(&add("1000 80 warning-only extra"), "maximum-prefix 1000 80 warning-only extra");
     n.round_trip(&add("1000 80 restart 5"));
+}
+
+#[test]
+fn negation_forms() {
+    let t = "model Interface\n  name: key string\n  switchport: flag = true\n  address: cidr?\n  shutdown: flag\n\nmodel Dev\n  ifaces: [Interface]\n\ntemplate\n  {{ ifaces }}\n";
+    let t = t.replace("model Dev", "template\n  interface {{ name }}\n   switchport {{ switchport }}\n   ip address {{ address }}\n   shutdown {{ shutdown }}\n\nmodel Dev");
+    let e = Engine::from_text("t", &t, Some("ios")).unwrap();
+    let cfg = "interface Gi0/1\n no switchport\n ip address 10.0.0.1 255.255.255.0\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\ninterface Gi0/3\n no ip address\n no shutdown\n!\nend\n";
+    let p = e.parse("Dev", cfg).unwrap();
+    let j = p.value.to_json();
+    assert_eq!(j["ifaces"][0]["switchport"], false);
+    assert_eq!(j["ifaces"][0]["address"], "10.0.0.1/24");
+    assert_eq!(j["ifaces"][1]["address"], serde_json::Value::Null);
+    assert_eq!(j["ifaces"][1]["shutdown"], true);
+    assert_eq!(j["ifaces"][2]["shutdown"], false);
+    assert!(p.unmanaged.is_empty());
+    // null renders `no ip address`; `no shutdown` is the default and disappears.
+    assert_eq!(e.render("Dev", &p.value).unwrap(), cfg.replace(" no shutdown\n", ""));
+    // Missing key: nothing written. null: the negated form.
+    let v = Value::from_json(&serde_json::json!({"ifaces": [{"name": "Gi0/4"}, {"name": "Gi0/5", "address": null}]}));
+    assert_eq!(e.render("Dev", &v).unwrap(), "interface Gi0/4\n!\ninterface Gi0/5\n no ip address\n!\nend\n");
+    assert!(e.parse("Dev", "interface Gi0/9\n no ip address\n ip address 10.0.0.1 255.255.255.0\n").unwrap_err().0.contains("matched twice"));
+    assert!(e.parse("Dev", "interface Gi0/9\n no ip address secondary\n").unwrap_err().0.contains("starts like a managed line"));
+    // Spelling the negated value line in the template is redundant now, and the validator says so.
+    let bad = t.replace("   ip address {{ address }}\n", "   ip address {{ address }}\n   no ip address {{ address }}\n");
+    let err = Engine::from_text("t", &bad, Some("ios")).unwrap_err();
+    assert!(err.0.contains("sets `address` to null"), "{err}");
+}
+
+#[test]
+fn explicit_negated_flag_spelling_and_explain() {
+    let t = "model I\n  name: key string\n  shutdown: flag = true\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n";
+    let t = t.replace("model D", "template\n  interface {{ name }}\n   shutdown {{ shutdown }}\n   no shutdown {{ shutdown }}\n\nmodel D");
+    let e = Engine::from_text("t", &t, Some("ios")).unwrap();
+    let p = e.parse("D", "interface Gi0/1\n no shutdown\ninterface Gi0/2\n shutdown\ninterface Gi0/3\n").unwrap();
+    let j = p.value.to_json();
+    assert_eq!(j["ifaces"][0]["shutdown"], false);
+    assert_eq!(j["ifaces"][1]["shutdown"], true);
+    assert_eq!(j["ifaces"][2]["shutdown"], true);
+    assert_eq!(e.render("D", &p.value).unwrap(), "interface Gi0/1\n no shutdown\n!\ninterface Gi0/2\n!\ninterface Gi0/3\n!\nend\n");
+    let x = e.explain("I").unwrap();
+    assert!(x.contains("shutdown (flag, default true)\n  true     → shutdown  (nothing written: default)\n  false    → no shutdown\n"), "{x}");
+    // A negated line without its positive partner is an error.
+    let bad = "model I\n  name: key string\n  shutdown: flag\n\ntemplate\n  interface {{ name }}\n   no shutdown {{ shutdown }}\n";
+    let err = Engine::from_text("t", bad, Some("ios")).unwrap_err();
+    assert!(err.0.contains("needs a normal line for this negated flag spelling"), "{err}");
+}
+
+#[test]
+fn implicit_negated_absent_form() {
+    let t = "model I\n  name: key string\n  address: cidr?\n  mtu: int = 1500\n  description: phrase?\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n";
+    let t = t.replace("model D", "template\n  interface {{ name }}\n   ip address {{ address }}\n   mtu {{ mtu }}\n   description {{ description }}\n\nmodel D");
+    let e = Engine::from_text("t", &t, Some("ios")).unwrap();
+    let p = e.parse("D", "interface Gi0/1\n no ip address\n no mtu\n no description\n").unwrap();
+    let j = p.value.to_json();
+    // Optional fields that are explicitly negated are null; a defaulted one is its default.
+    assert_eq!(j["ifaces"][0], serde_json::json!({"name": "Gi0/1", "address": null, "mtu": 1500, "description": null}));
+    assert!(p.unmanaged.is_empty());
+    // null renders the negated form, so the round trip is exact (except `no mtu`, which is the default).
+    assert_eq!(e.render("D", &p.value).unwrap(), "interface Gi0/1\n no ip address\n no description\n!\nend\n");
+    // Missing keys write nothing; null in intent data is the "clear it" verb.
+    let v = Value::from_json(&serde_json::json!({"ifaces": [{"name": "Gi0/2"}, {"name": "Gi0/3", "address": null, "mtu": null}]}));
+    assert_eq!(e.render("D", &v).unwrap(), "interface Gi0/2\n!\ninterface Gi0/3\n no ip address\n no mtu\n!\nend\n");
+    let sch = e.schema("D").unwrap();
+    assert_eq!(sch["$defs"]["I"]["properties"]["address"]["anyOf"][1]["type"], "null");
+    // The negated form with a value is not a running-config statement: strict error.
+    assert!(e.parse("D", "interface Gi0/1\n no ip address 10.0.0.1 255.255.255.0\n").unwrap_err().0.contains("starts like a managed line"));
+    assert!(e.parse("D", "interface Gi0/1\n no ip address\n ip address 10.0.0.1 255.255.255.0\n").unwrap_err().0.contains("matched twice"));
+    // Flat groups too.
+    let f = "model N\n  peer: key ip\n  remoteAs: asn?\n  desc: phrase?\n\nmodel B\n  asn: key asn\n  nbrs: [N]\n\ntemplate\n  router bgp {{ asn }}\n    {{ nbrs }}\n";
+    let f = f.replace("model B", "template\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel B");
+    let e = Engine::from_text("t", &f, Some("eos")).unwrap();
+    let p = e.parse("B", "router bgp 1\n   neighbor 10.0.0.1 remote-as 65001\n   no neighbor 10.0.0.1 description\n").unwrap();
+    assert_eq!(p.value.to_json()["nbrs"][0], serde_json::json!({"peer": "10.0.0.1", "remoteAs": 65001, "desc": null}));
+    assert!(e.render("B", &p.value).unwrap().contains("   no neighbor 10.0.0.1 description\n"));
+    assert!(e.parse("B", "router bgp 1\n   no neighbor 10.0.0.1 remote-as 65001\n").unwrap_err().0.contains("starts like a managed line"));
+    // No negation word in the dialect: `no ip address` is just an unknown line.
+    let jt = "model I\n  name: key string\n  address: cidr?\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n".replace("model D", "template\n  interface {{ name }} {\n    ip address {{ address }};\n  }\n\nmodel D");
+    let j = Engine::from_text("t", &jt, Some("junos")).unwrap();
+    let p = j.parse("D", "interface Gi0/1 { no ip address; }").unwrap();
+    assert_eq!(p.unmanaged_paths(), vec!["interface Gi0/1 > no ip address"]);
+    let x = e.explain("N").unwrap();
+    assert!(x.contains("  null     → neighbor <peer:ip> no description\n"), "{x}");
 }

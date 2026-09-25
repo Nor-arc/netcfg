@@ -38,6 +38,10 @@ impl Engine {
                     if let (Some(d), Some(o)) = (&f.default, s.as_object_mut()) {
                         o.insert("default".into(), J::String(d.join(" ")));
                     }
+                    // With a negation word, `null` is the explicitly negated form (`no ip address`).
+                    if f.kind == Kind::Opt && self.dialect.negation.is_some() {
+                        s = json!({"anyOf": [s, {"type": "null", "description": "explicitly negated"}]});
+                    }
                     s
                 }
             };

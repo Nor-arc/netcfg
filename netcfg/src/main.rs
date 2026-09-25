@@ -30,6 +30,8 @@ enum Cmd {
     },
     /// Render model data (JSON/YAML) to config text.
     Render { templates: PathBuf, data: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
+    /// Show how every field of a model is spelled in config (values, defaults, negations).
+    Explain { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Print the JSON Schema for a model's data.
     Schema { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Time parse and render on a config.
@@ -74,6 +76,11 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Render { templates, data, model, dialect: d } => {
             let e = load(&templates, &d)?;
             print!("{}", e.render(&model, &read_data(&data)?).map_err(|e| e.0)?);
+            Ok(())
+        }
+        Cmd::Explain { templates, model, dialect: d } => {
+            let e = load(&templates, &d)?;
+            print!("{}", e.explain(&model).map_err(|e| e.0)?);
             Ok(())
         }
         Cmd::Schema { templates, model, dialect: d } => {

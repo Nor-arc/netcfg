@@ -65,6 +65,13 @@ impl Pattern {
             other => other,
         }
     }
+    /// The literal tokens before the first hole (`ip address` for `ip address {{ address }}`).
+    fn literal_prefix(&self) -> Vec<&str> {
+        self.toks.iter().take_while(|t| matches!(t, PTok::Lit(_))).map(|t| match t { PTok::Lit(s) => s.as_str(), _ => unreachable!() }).collect()
+    }
+    fn has_holes(&self) -> bool { self.toks.iter().any(|t| matches!(t, PTok::Hole { .. })) }
+    fn hole_fields(&self) -> Vec<usize> { self.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(*field), _ => None }).collect() }
+
     /// The line starts like this pattern: literals and key holes match up to the first value hole.
     fn collides(&self, toks: &[&str]) -> bool {
         let mut pos = 0;
@@ -238,13 +245,13 @@ impl Engine {
                 Err(es) => { errs.extend(es); Vec::new() }
             };
             if !lines.is_empty() {
-                errs.extend(template::validate(&d.name, &lines, &d.fields, &rest));
+                errs.extend(template::validate(&d.name, &lines, &d.fields, &rest, dialect.negation.as_deref()));
             }
             if !errs.is_empty() {
                 errors.push(ctx(format!("\n  - {}", errs.join("\n  - "))));
                 continue;
             }
-            match compile(d, &lines, &field_types, &index) {
+            match compile(d, &lines, &field_types, &index, dialect.negation.as_deref()) {
                 Ok(c) => { models.insert(d.name.clone(), c); }
                 Err(e) => errors.push(ctx(e.0)),
             }
@@ -306,7 +313,7 @@ fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<V
     Ok(resolved)
 }
 
-fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>) -> Result<Compiled> {
+fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>, negation: Option<&str>) -> Result<Compiled> {
     let fields = &d.fields;
     let fidx = |n: &str| fields.iter().position(|f| f.name == n).unwrap();
     let pattern = |toks: &[Tok]| -> Pattern {
@@ -326,7 +333,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             _ => Ok(None),
         }
     };
-    fn slot_of(l: &TLine, key_prefix_len: usize, fields: &[FieldDef], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>) -> Result<Slot> {
+    fn slot_of(l: &TLine, _siblings: &[TLine], key_prefix_len: usize, fields: &[FieldDef], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>, negation: Option<&str>) -> Result<Slot> {
         let fidx = |n: &str| fields.iter().position(|f| f.name == n).unwrap();
         let pattern = |toks: &[Tok]| -> Pattern {
             Pattern { toks: toks.iter().map(|t| match t {
@@ -346,9 +353,10 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             }
         };
         if !l.children.is_empty() && l.holes().is_empty() {
+            let kids: Vec<TLine> = l.children.iter().filter(|c| !c.ignore).cloned().collect();
             return Ok(Slot::Container {
                 lits: pattern(&l.toks),
-                body: l.children.iter().filter(|c| !c.ignore).map(|c| slot_of(c, 0, fields, field_types, index)).collect::<Result<_>>()?,
+                body: kids.iter().filter(|c| template::absent_spelling_of(c, negation, fields).is_none() && template::negated_flag_line(c, negation, fields).is_none()).map(|c| slot_of(c, &kids, 0, fields, field_types, index, negation)).collect::<Result<_>>()?,
                 ignores: l.children.iter().filter(|c| c.ignore).map(|c| c.lits()).collect(),
             });
         }
@@ -366,22 +374,23 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             _ => Ok(Slot::Line { pat: pattern(toks), mode: Mode::Required }),
         }
     }
-    let slot = |l: &TLine, key_prefix_len: usize| -> Result<Slot> { slot_of(l, key_prefix_len, fields, field_types, index) };
+    let slot = |l: &TLine, siblings: &[TLine], key_prefix_len: usize| -> Result<Slot> { slot_of(l, siblings, key_prefix_len, fields, field_types, index, negation) };
+    let not_absent = |ls: &[TLine]| -> Vec<TLine> { ls.iter().filter(|l| template::absent_spelling_of(l, negation, fields).is_none() && template::negated_flag_line(l, negation, fields).is_none()).cloned().collect() };
     let keys: Vec<&str> = fields.iter().filter(|f| f.kind == Kind::Key).map(|f| f.name.as_str()).collect();
     let (shape, ignores) = match template::shape(lines, &keys).map_err(Error)? {
-        Shape::Root { body, ignores } => (CShape::Root { body: body.iter().map(|l| slot(l, 0)).collect::<Result<_>>()? }, ignores),
+        Shape::Root { body, ignores } => (CShape::Root { body: not_absent(&body).iter().map(|l| slot(l, &body, 0)).collect::<Result<_>>()? }, ignores),
         Shape::Block { header, body, ignores } => (
             CShape::Block {
                 header: pattern(&header.toks),
                 key_fields: header.holes().into_iter().map(fidx).filter(|&i| fields[i].kind == Kind::Key).collect(),
-                body: body.iter().map(|l| slot(l, 0)).collect::<Result<_>>()?,
+                body: not_absent(&body).iter().map(|l| slot(l, &body, 0)).collect::<Result<_>>()?,
             },
             ignores,
         ),
         Shape::Flat { lines: flat, ignores } => {
             let key_len = |l: &TLine| l.toks.iter().rposition(|t| matches!(t, Tok::Hole(n) if keys.contains(&n.as_str()))).map(|p| p + 1).unwrap_or(0);
             let keys_pat = pattern(&flat[0].toks[..key_len(&flat[0])]);
-            (CShape::Flat { keys: keys_pat, lines: flat.iter().map(|l| slot(l, key_len(l))).collect::<Result<_>>()? }, ignores)
+            (CShape::Flat { keys: keys_pat, lines: flat.iter().map(|l| slot(l, &[], key_len(l))).collect::<Result<_>>()? }, ignores)
         }
     };
     // Defaults must parse even when the field is on a multi-value line or the header.
@@ -485,16 +494,25 @@ impl Engine {
 
     fn claim(&self, slot: &Slot, state: &mut SlotState, n: &Node<'_>, unmanaged: &mut Vec<OwnedNode>) -> Claim {
         match (slot, state) {
-            (Slot::Line { pat, .. }, SlotState::Line(st)) => match pat.parse_full(&n.tokens) {
-                PRes::Ok(vals, _) => {
+            (Slot::Line { pat, mode }, SlotState::Line(st)) => {
+                if self.negated_bare(pat, &n.tokens) {
                     if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
-                    *st = Some(vals);
+                    // An optional value that is explicitly negated is `null`; a defaulted one is its default.
+                    *st = Some(match mode { Mode::Opt => pat.hole_fields().into_iter().map(|f| (f, Value::Null)).collect(), _ => Vec::new() });
                     remnant(n, unmanaged);
-                    Claim::Claimed
+                    return Claim::Claimed;
                 }
-                PRes::Bad(e) => Claim::Failed(format!("`{}`: {e}", n.line_text())),
-                PRes::NoMatch => Claim::NotMine,
-            },
+                match pat.parse_full(&n.tokens) {
+                    PRes::Ok(vals, _) => {
+                        if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
+                        *st = Some(vals);
+                        remnant(n, unmanaged);
+                        Claim::Claimed
+                    }
+                    PRes::Bad(e) => Claim::Failed(format!("`{}`: {e}", n.line_text())),
+                    PRes::NoMatch => Claim::NotMine,
+                }
+            }
             (Slot::Container { lits, body, ignores }, SlotState::Container(st)) => match lits.parse_full(&n.tokens) {
                 PRes::Ok(..) => {
                     if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
@@ -504,7 +522,7 @@ impl Engine {
                             *st = Some(states);
                             if !inner.is_empty() {
                                 // Keep the container in the path so the report reads like config.
-                                unmanaged.push(OwnedNode { tokens: n.tokens.iter().map(|t| t.to_string()).collect(), children: inner });
+                                unmanaged.push(OwnedNode { tokens: n.tokens.iter().map(|t| t.to_string()).collect(), children: inner, block: false });
                             }
                             Claim::Claimed
                         }
@@ -514,7 +532,9 @@ impl Engine {
                 _ => Claim::NotMine,
             },
             (Slot::Flag { lits, .. }, SlotState::Flag(st)) => {
-                let (toks, negated) = self.strip_no(&n.tokens);
+                // A flag written with the negation word in the template (`no ip address`) is
+                // matched literally: its only spelling is the negated one.
+                let (toks, negated) = if self.literal_no(lits) { (&n.tokens[..], false) } else { self.strip_no(&n.tokens) };
                 match lits.parse_full(toks) {
                     PRes::Ok(..) => {
                         if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
@@ -543,7 +563,7 @@ impl Engine {
                         };
                         items.push(rec);
                         if !inner.is_empty() {
-                            unmanaged.push(OwnedNode { tokens: n.tokens.iter().map(|t| t.to_string()).collect(), children: inner });
+                            unmanaged.push(OwnedNode { tokens: n.tokens.iter().map(|t| t.to_string()).collect(), children: inner, block: true });
                         }
                         Claim::Claimed
                     }
@@ -564,8 +584,16 @@ impl Engine {
                 let mut hit: Option<(usize, Option<Vec<(usize, Value)>>)> = None;
                 for (i, slot) in lines.iter().enumerate() {
                     match slot {
-                        Slot::Line { pat, .. } => {
-                            if negated { continue; }
+                        Slot::Line { pat, mode, .. } => {
+                            if negated {
+                                // `no neighbor X remote-as`: the negated bare form. Optional -> null, defaulted -> default.
+                                if pat.has_holes() && rest == pat.literal_prefix().as_slice() {
+                                    let vals = match mode { Mode::Opt => pat.hole_fields().into_iter().map(|f| (f, Value::Null)).collect(), _ => Vec::new() };
+                                    hit = Some((i, Some(vals)));
+                                    break;
+                                }
+                                continue;
+                            }
                             match pat.parse_full(rest) {
                                 PRes::Ok(vals, _) => { hit = Some((i, Some(vals))); break; }
                                 PRes::Bad(e) => return Claim::Failed(format!("`{}`: {e}", n.line_text())),
@@ -601,15 +629,18 @@ impl Engine {
 
     fn collides(&self, slot: &Slot, n: &Node<'_>) -> bool {
         match slot {
-            Slot::Line { pat, .. } => pat.collides(&n.tokens),
-            Slot::Flag { lits, .. } => lits.collides(self.strip_no(&n.tokens).0),
+            Slot::Line { pat, .. } => {
+                let (toks, negated) = self.strip_no(&n.tokens);
+                pat.collides(&n.tokens) || (negated && pat.has_holes() && toks.starts_with(pat.literal_prefix().as_slice()))
+            }
+            Slot::Flag { lits, .. } => if self.literal_no(lits) { lits.collides(&n.tokens) } else { lits.collides(self.strip_no(&n.tokens).0) },
             Slot::Container { lits, .. } => lits.collides(&n.tokens),
             Slot::Many { model, .. } => match &self.models[*model].shape {
                 CShape::Flat { keys, lines } => {
                     let (toks, _) = self.strip_no(&n.tokens);
                     match keys.parse_prefix(toks) {
                         PRes::Ok(_, used) => lines.iter().any(|l| match l {
-                            Slot::Line { pat, .. } => pat.collides(&toks[used..]),
+                            Slot::Line { pat, .. } => pat.collides(&toks[used..]) || (pat.has_holes() && toks[used..].starts_with(pat.literal_prefix().as_slice())),
                             Slot::Flag { lits, .. } => lits.collides(&toks[used..]),
                             _ => false,
                         }),
@@ -636,7 +667,7 @@ impl Engine {
         };
         for (slot, state) in slots.iter().zip(states) {
             match (slot, state) {
-                (Slot::Line { .. }, Some(SlotState::Line(Some(vs)))) => { for (i, v) in vs { vals[i] = Some(v); } }
+                (Slot::Line { .. }, Some(SlotState::Line(Some(vs)))) if !vs.is_empty() => { for (i, v) in vs { vals[i] = Some(v); } }
                 (Slot::Line { pat, mode }, _) => match mode {
                     Mode::Required => return Err(Error(format!("required line `{}` is missing", pat.show(&m.fields)))),
                     Mode::Opt => {}
@@ -700,7 +731,7 @@ impl Engine {
     fn render_one(&self, m: &Compiled, rec: &Record) -> Result<Vec<OwnedNode>> {
         match &m.shape {
             CShape::Root { body } => self.render_body(m, body, rec),
-            CShape::Block { header, body, .. } => Ok(vec![OwnedNode { tokens: header.render(&m.fields, rec)?, children: self.render_body(m, body, rec)? }]),
+            CShape::Block { header, body, .. } => Ok(vec![OwnedNode::with_children(header.render(&m.fields, rec)?, self.render_body(m, body, rec)?)]),
             CShape::Flat { keys, lines } => {
                 let prefix = keys.render(&m.fields, rec)?;
                 let mut out = Vec::new();
@@ -721,11 +752,31 @@ impl Engine {
         for slot in slots {
             match slot {
                 Slot::Line { pat, mode } => {
-                    let hole_fields: Vec<usize> = pat.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(*field), _ => None }).collect();
+                    let hole_fields = pat.hole_fields();
                     let present = hole_fields.iter().filter(|&&i| rec.get(&m.fields[i].name).map(|v| !v.is_null()).unwrap_or(false)).count();
+                    let nulls = hole_fields.iter().filter(|&&i| rec.get(&m.fields[i].name).map(Value::is_null).unwrap_or(false)).count();
                     match mode {
-                        Mode::Opt => { if present == 0 { continue; } }
-                        Mode::Default(d) => { if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; } }
+                        Mode::Opt => {
+                            if present == 0 {
+                                if nulls > 0 {
+                                    // `null` means "explicitly negated": write the negated form.
+                                    match &self.dialect.negation {
+                                        Some(n) => out.push(OwnedNode::leaf(std::iter::once(n.clone()).chain(pat.literal_prefix().iter().map(|s| s.to_string())).collect())),
+                                        None => return Err(Error(format!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name))),
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        Mode::Default(d) => {
+                            if nulls > 0 {
+                                match &self.dialect.negation {
+                                    Some(n) => { out.push(OwnedNode::leaf(std::iter::once(n.clone()).chain(pat.literal_prefix().iter().map(|s| s.to_string())).collect())); continue; }
+                                    None => return Err(Error(format!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name))),
+                                }
+                            }
+                            if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; }
+                        }
                         Mode::Required => { if present < hole_fields.len() { return Err(Error(format!("required line `{}`: field(s) missing", pat.show(&m.fields)))); } }
                     }
                     out.push(OwnedNode::leaf(pat.render(&m.fields, rec)?));
@@ -737,14 +788,17 @@ impl Engine {
                         Some(v) => return Err(Error(format!("field `{}`: expected true/false, got {v:?}", m.fields[*field].name))),
                     };
                     if v == *default { continue; }
-                    let mut toks = if v { Vec::new() } else { vec!["no".to_string()] };
+                    if !v && (self.dialect.negation.is_none() || self.literal_no(lits)) {
+                        return Err(Error(format!("field `{}`: false has no spelling in this dialect (there is no negation for `{}`)", m.fields[*field].name, lits.show(&m.fields))));
+                    }
+                    let mut toks = if v { Vec::new() } else { vec![self.dialect.negation.clone().unwrap()] };
                     toks.extend(lits.render(&m.fields, rec)?);
                     out.push(OwnedNode::leaf(toks));
                 }
                 Slot::Container { lits, body, .. } => {
                     let children = self.render_body(m, body, rec)?;
                     if !children.is_empty() {
-                        out.push(OwnedNode { tokens: lits.render(&m.fields, rec)?, children });
+                        out.push(OwnedNode { tokens: lits.render(&m.fields, rec)?, children, block: false });
                     }
                 }
                 Slot::Many { field, model } => {
@@ -765,6 +819,10 @@ impl Engine {
     }
 }
 
+fn fmt_value(v: &Value) -> String {
+    match v { Value::Str(s) => s.clone(), Value::Int(i) => i.to_string(), Value::Bool(b) => b.to_string(), v => format!("{:?}", v.to_json()) }
+}
+
 fn build_record(m: &Compiled, vals: Vec<Option<Value>>) -> Record {
     let mut rec = Record::with_capacity(m.fields.len());
     for (f, v) in m.fields.iter().zip(vals) {
@@ -774,6 +832,90 @@ fn build_record(m: &Compiled, vals: Vec<Option<Value>>) -> Record {
 }
 
 impl Engine {
+    /// A human-readable table of how every field of `model` is spelled in config.
+    pub fn explain(&self, model: &str) -> Result<String> {
+        let mi = self.model_idx(model)?;
+        let m = &self.models[mi];
+        let mut out = String::new();
+        let neg = self.dialect.negation.as_deref();
+        let show = |p: &Pattern| p.toks.iter().map(|t| match t {
+            PTok::Lit(s) => s.clone(),
+            PTok::Hole { field, ty, .. } => format!("<{}:{}>", m.fields[*field].name, ty.describe()),
+        }).collect::<Vec<_>>().join(" ");
+        fn walk(e: &Engine, m: &Compiled, slots: &[Slot], prefix: &str, show: &dyn Fn(&Pattern) -> String, neg: Option<&str>, out: &mut String) {
+            for slot in slots {
+                match slot {
+                    Slot::Line { pat, mode } => {
+                        let names: Vec<&str> = pat.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(m.fields[*field].name.as_str()), _ => None }).collect();
+                        let kind = match mode { Mode::Required => "required".to_string(), Mode::Opt => "optional".to_string(), Mode::Default(d) => format!("default {}", fmt_value(d)) };
+                        out.push_str(&format!("{} ({kind})\n", names.join(", ")));
+                        out.push_str(&format!("  value    → {prefix}{}\n", show(pat)));
+                        match mode {
+                            Mode::Opt => {
+                                out.push_str("  missing  → (nothing written)\n");
+                                if let Some(n) = neg { if pat.has_holes() { out.push_str(&format!("  null     → {prefix}{n} {}\n", pat.literal_prefix().join(" "))); } }
+                            }
+                            Mode::Default(_) => match neg {
+                                Some(n) if pat.has_holes() => out.push_str(&format!("  default  → (nothing written; `{prefix}{n} {}` is read as the default)\n  null     → {prefix}{n} {}\n", pat.literal_prefix().join(" "), pat.literal_prefix().join(" "))),
+                                _ => out.push_str("  default  → (nothing written)\n"),
+                            },
+                            _ => {}
+                        }
+                    }
+                    Slot::Flag { lits, field, default } => {
+                        let f = &m.fields[*field];
+                        let literal_no = e.literal_no(lits);
+                        out.push_str(&format!("{} (flag, default {default})\n", f.name));
+                        let pos = format!("{prefix}{}", show(lits));
+                        let write = |v: bool| if v == *default { "  (nothing written: default)" } else { "" };
+                        if literal_no {
+                            out.push_str(&format!("  true     → {pos}{}\n", write(true)));
+                            out.push_str(&format!("  false    → (no spelling){}\n", write(false)));
+                        } else {
+                            out.push_str(&format!("  true     → {pos}{}\n", write(true)));
+                            match neg {
+                                Some(n) => out.push_str(&format!("  false    → {prefix}{n} {}{}\n", show(lits), write(false))),
+                                None => out.push_str(&format!("  false    → (no spelling in this dialect){}\n", write(false))),
+                            }
+                        }
+                    }
+                    Slot::Many { field, model } => {
+                        out.push_str(&format!("{} (list of {})\n", m.fields[*field].name, e.models[*model].name));
+                        out.push_str(&format!("  each     → {prefix}one {} block/group\n", e.models[*model].name));
+                    }
+                    Slot::Container { lits, body, .. } => {
+                        walk(e, m, body, &format!("{prefix}{} > ", show(lits)), show, neg, out);
+                    }
+                }
+            }
+        }
+        out.push_str(&format!("{} ({} dialect)\n", m.name, self.dialect.name));
+        match &m.shape {
+            CShape::Root { body } => walk(self, m, body, "", &show, neg, &mut out),
+            CShape::Block { header, key_fields, body } => {
+                let keys: Vec<&str> = key_fields.iter().map(|i| m.fields[*i].name.as_str()).collect();
+                out.push_str(&format!("header (identity: {})\n  → {}\n", keys.join(", "), show(header)));
+                walk(self, m, body, "", &show, neg, &mut out);
+            }
+            CShape::Flat { keys, lines } => {
+                out.push_str(&format!("flat group; every line starts with: {}\n", show(keys)));
+                walk(self, m, lines, &format!("{} ", show(keys)), &show, neg, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `no <literal prefix>` of a value line: its implicit absent form.
+    fn negated_bare(&self, pat: &Pattern, toks: &[&str]) -> bool {
+        let (rest, negated) = self.strip_no(toks);
+        negated && pat.has_holes() && rest == pat.literal_prefix().as_slice()
+    }
+
+    /// True when a flag's literals themselves start with the negation word.
+    fn literal_no(&self, lits: &Pattern) -> bool {
+        matches!((&self.dialect.negation, lits.toks.first()), (Some(neg), Some(PTok::Lit(first))) if first == neg)
+    }
+
     /// Split off the dialect's negation prefix (`no shutdown`), if it has one.
     fn strip_no<'a, 'b>(&self, toks: &'b [&'a str]) -> (&'b [&'a str], bool) {
         match (&self.dialect.negation, toks.first()) {
