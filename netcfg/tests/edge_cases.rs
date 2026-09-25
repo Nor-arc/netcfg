@@ -133,7 +133,7 @@ fn nxos_invariants() {
 fn nxos_must_parse_to() {
     let s = Suite::new("nxos", "Device", NX);
     s.parses_to(&s.rep("    remote-as 65001\n", ""), |j| j["bgp"][0]["neighbors"][0].get("remoteAs").is_none());
-    s.parses_to(&s.append("      maximum-prefix 1000 80 warning-only\n"), |j| j["bgp"][0]["neighbors"][0]["addressFamilies"][0]["maximumPrefix"] == serde_json::json!(["1000", "80", "warning-only"]));
+    s.parses_to(&s.append("      maximum-prefix 1000 80 warning-only\n"), |j| j["bgp"][0]["neighbors"][0]["addressFamilies"][0]["maximumPrefix"] == serde_json::json!({"limit": 1000, "threshold": 80, "action": "warning-only"}));
     s.parses_to(&s.append("    inherit peer SPINE\n"), |j| j["bgp"][0]["neighbors"][0]["inheritPeer"] == "SPINE");
     s.parses_to(&s.rep("match ip address prefix-list PL-1", "match ip address prefix-list PL-1 PL-2"), |j| j["routeMaps"][0]["matchPrefixLists"] == serde_json::json!(["PL-1", "PL-2"]));
     s.parses_to(&s.rep("match ip address prefix-list PL-1", "match ip address ACL-1"), |j| j["routeMaps"][0]["matchAcl"] == "ACL-1");
@@ -265,4 +265,37 @@ fn optional_trailing_value_via_empty_literal() {
     let bad = "type g = string | \"\"\n\nmodel M\n  a: key string\n  b: g\n  c: int\n\ntemplate\n  x {{ a }}\n    y {{ b }} {{ c }}\n";
     let err = Engine::from_text("t", bad, Some("eos")).unwrap_err();
     assert!(err.0.contains("`b` consumes the rest of the line, so it must be last"), "{err}");
+}
+
+#[test]
+fn struct_types() {
+    let s = Suite::new("eos", "EosDevice", EO);
+    let add = |l: &str| s.append(&format!("   neighbor 10.1.0.1 maximum-routes {l}\n"));
+    s.parses_to(&add("1200"), |j| j["bgp"][0]["neighbors"][0]["maximumRoutes"] == serde_json::json!({"limit": 1200}));
+    s.parses_to(&add("1200 warning-only"), |j| j["bgp"][0]["neighbors"][0]["maximumRoutes"] == serde_json::json!({"limit": 1200, "action": "warning-only"}));
+    // `loudly` matches no alternative, the empty one is taken, and the leftover token makes the line unrepresentable.
+    s.fails(&add("1200 loudly"), "maximum-routes 1200 loudly`: starts like a managed line");
+    s.fails(&add("many"), "maxRoutes.limit: 'many' is not an integer");
+    s.fails(&add("warning-only 1200"), "warning-only");
+    s.round_trip(&add("1200 warning-limit"));
+    assert!(s.e.render("EosDevice", &s.e.parse("EosDevice", &add("1200 warning-only")).unwrap().value).unwrap().contains("neighbor 10.1.0.1 maximum-routes 1200 warning-only\n"));
+    // rendering validates the record shape
+    let mut v = s.e.parse("EosDevice", &add("1200")).unwrap().value.to_json();
+    v["bgp"][0]["neighbors"][0]["maximumRoutes"] = serde_json::json!({"limit": 1200, "actoin": "warning-only"});
+    assert!(s.e.render("EosDevice", &Value::from_json(&v)).unwrap_err().0.contains("unknown field `actoin`"));
+    v["bgp"][0]["neighbors"][0]["maximumRoutes"] = serde_json::json!({"action": "warning-only"});
+    assert!(s.e.render("EosDevice", &Value::from_json(&v)).unwrap_err().0.contains("field `limit` is missing"));
+    let sch = s.e.schema("EosDevice").unwrap();
+    assert_eq!(sch["$defs"]["EosNeighbor"]["properties"]["maximumRoutes"]["required"], serde_json::json!(["limit"]));
+
+    // NX-OS: optional middle parts.
+    let n = Suite::new("nxos", "Device", NX);
+    let add = |l: &str| n.append(&format!("      maximum-prefix {l}\n"));
+    let mp = |j: &serde_json::Value| j["bgp"][0]["neighbors"][0]["addressFamilies"][0]["maximumPrefix"].clone();
+    n.parses_to(&add("1000"), |j| mp(j) == serde_json::json!({"limit": 1000}));
+    n.parses_to(&add("1000 80"), |j| mp(j) == serde_json::json!({"limit": 1000, "threshold": 80}));
+    n.parses_to(&add("1000 warning-only"), |j| mp(j) == serde_json::json!({"limit": 1000, "action": "warning-only"}));
+    n.parses_to(&add("1000 80 restart 5"), |j| mp(j) == serde_json::json!({"limit": 1000, "threshold": 80, "action": "restart", "restart": 5}));
+    n.fails(&add("1000 80 warning-only extra"), "maximum-prefix 1000 80 warning-only extra");
+    n.round_trip(&add("1000 80 restart 5"));
 }

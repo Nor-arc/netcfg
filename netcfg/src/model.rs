@@ -58,6 +58,16 @@ pub enum TypeBody {
     Regex(String),
     /// Alternatives tried in order: `"literal"` tokens or references to other types.
     Union(Vec<Alt>),
+    /// A structured value: literals and named placeholders, e.g.
+    /// `{{ limit: int }} {{ action: "warning-only" | "" }}`. The value is a record.
+    Struct(Vec<StructTok>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructTok {
+    Lit(String),
+    /// `{{ name: spec }}`; `spec` is a type name/spec or an inline `a | "b"` union.
+    Field { name: String, spec: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +185,12 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
                         None => { err(&mut errors, ln, "expected `type NAME = /regex/` or `type NAME = a | b`".into()); continue; }
                     };
                     if !is_ident(name) { err(&mut errors, ln, format!("`{name}` is not a valid type name")); continue; }
-                    let def = if body.starts_with('/') && body.ends_with('/') && body.len() >= 2 {
+                    let def = if body.contains("{{") {
+                        match parse_struct_body(body) {
+                            Ok(toks) => TypeBody::Struct(toks),
+                            Err(e) => { err(&mut errors, ln, format!("type `{name}`: {e}")); continue; }
+                        }
+                    } else if body.starts_with('/') && body.ends_with('/') && body.len() >= 2 {
                         match regex::Regex::new(&body[1..body.len() - 1]) {
                             Ok(_) => TypeBody::Regex(body[1..body.len() - 1].to_string()),
                             Err(e) => { err(&mut errors, ln, format!("invalid regex for type `{name}`: {e}")); continue; }
@@ -236,6 +251,48 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
     }
 
     if errors.is_empty() { Ok(file) } else { Err(Error(errors.join("\n"))) }
+}
+
+fn parse_struct_body(body: &str) -> std::result::Result<Vec<StructTok>, String> {
+    let mut toks = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        match rest.find("{{") {
+            Some(start) => {
+                for w in rest[..start].split_ascii_whitespace() { toks.push(StructTok::Lit(w.to_string())); }
+                let end = rest[start..].find("}}").ok_or("unterminated `{{`")? + start;
+                let inner = rest[start + 2..end].trim();
+                let (name, spec) = inner.split_once(':').ok_or_else(|| format!("placeholder `{{{{ {inner} }}}}` must be `{{{{ name: type }}}}`"))?;
+                let (name, spec) = (name.trim(), spec.trim());
+                if !is_ident(name) { return Err(format!("`{name}` is not a valid field name")); }
+                if spec.is_empty() { return Err(format!("placeholder `{name}` has no type")); }
+                if toks.iter().any(|t| matches!(t, StructTok::Field { name: n, .. } if n == name)) { return Err(format!("duplicate field `{name}`")); }
+                toks.push(StructTok::Field { name: name.to_string(), spec: spec.to_string() });
+                rest = &rest[end + 2..];
+            }
+            None => {
+                for w in rest.split_ascii_whitespace() { toks.push(StructTok::Lit(w.to_string())); }
+                rest = "";
+            }
+        }
+    }
+    if !toks.iter().any(|t| matches!(t, StructTok::Field { .. })) { return Err("a struct type needs at least one placeholder".into()); }
+    Ok(toks)
+}
+
+/// Split an inline union spec (`asn | "auto" | ""`) into alternatives; a plain spec yields one type alt.
+pub fn parse_alts(spec: &str) -> std::result::Result<Vec<Alt>, String> {
+    let mut alts = Vec::new();
+    for part in spec.split('|').map(str::trim) {
+        if let Some(lit) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            alts.push(Alt::Lit(lit.to_string()));
+        } else if is_ident(part) || part.starts_with("int(") || part.starts_with("list(") {
+            alts.push(Alt::Type(part.to_string()));
+        } else {
+            return Err(format!("`{part}` is neither a type name nor a \"quoted\" literal"));
+        }
+    }
+    Ok(alts)
 }
 
 fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {

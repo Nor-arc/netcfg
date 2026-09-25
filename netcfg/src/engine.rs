@@ -9,7 +9,7 @@ use crate::dialect::Dialect;
 use crate::lexer::{Node, OwnedNode};
 use crate::model::{self, FieldDef, Kind, TypeBody};
 use crate::template::{self, Shape, TLine, Tok};
-use crate::types::{Alt, Catalog, RegexType, ScalarRef, UnionType};
+use crate::types::{Alt, Catalog, RegexType, SToken, ScalarRef, StructType, UnionType};
 use crate::value::{Record, Value};
 use crate::{Error, Result};
 use indexmap::IndexMap;
@@ -173,19 +173,31 @@ impl Engine {
             if catalog.get(&t.name).is_some() { errors.push(format!("type `{}` (line {}) is already defined", t.name, t.line)); continue; }
             match &t.def {
                 TypeBody::Regex(r) => catalog.add(Arc::new(RegexType { name: t.name.clone(), source: r.clone(), re: regex::Regex::new(&format!("^(?:{r})$")).map_err(|e| Error(e.to_string()))? })),
-                TypeBody::Union(alts) => {
-                    let mut resolved = Vec::new();
-                    for a in alts {
-                        match a {
-                            model::Alt::Lit(l) => resolved.push(Alt::Lit(l.clone())),
-                            model::Alt::Type(n) => match catalog.resolve(n) {
-                                Some(ty) if ty.rest_of_line() => errors.push(format!("type `{}` (line {}): `{n}` consumes the rest of the line and cannot be a union alternative", t.name, t.line)),
-                                Some(ty) => resolved.push(Alt::Type(ty)),
-                                None => errors.push(format!("type `{}` (line {}): unknown type `{n}` (define it above, or quote it if it is a literal)", t.name, t.line)),
-                            },
+                TypeBody::Union(alts) => match resolve_alts(&catalog, alts) {
+                    Ok(resolved) => catalog.add(Arc::new(UnionType { name: t.name.clone(), alts: resolved })),
+                    Err(e) => errors.push(format!("type `{}` (line {}): {e}", t.name, t.line)),
+                },
+                TypeBody::Struct(toks) => {
+                    let mut out = Vec::new();
+                    let mut ok = true;
+                    for tok in toks {
+                        match tok {
+                            model::StructTok::Lit(l) => out.push(SToken::Lit(l.clone())),
+                            model::StructTok::Field { name, spec } => {
+                                let ty: Result<ScalarRef> = if spec.contains('|') {
+                                    model::parse_alts(spec).map_err(Error).and_then(|alts| resolve_alts(&catalog, &alts).map_err(Error))
+                                        .map(|alts| Arc::new(UnionType { name: format!("{}.{name}", t.name), alts }) as ScalarRef)
+                                } else {
+                                    catalog.resolve(spec).ok_or_else(|| Error(format!("unknown type `{spec}`")))
+                                };
+                                match ty {
+                                    Ok(ty) => out.push(SToken::Field { name: name.clone(), ty }),
+                                    Err(e) => { errors.push(format!("type `{}` (line {}): field `{name}`: {}", t.name, t.line, e.0)); ok = false; }
+                                }
+                            }
                         }
                     }
-                    catalog.add(Arc::new(UnionType { name: t.name.clone(), alts: resolved }));
+                    if ok { catalog.add(Arc::new(StructType { name: t.name.clone(), toks: out })); }
                 }
             }
         }
@@ -277,6 +289,21 @@ impl Engine {
     fn model_idx(&self, name: &str) -> Result<usize> {
         self.models.get_index_of(name).ok_or_else(|| Error(format!("unknown model `{name}` (known: {})", self.model_names().join(", "))))
     }
+}
+
+fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<Vec<Alt>, String> {
+    let mut resolved = Vec::new();
+    for a in alts {
+        match a {
+            model::Alt::Lit(l) => resolved.push(Alt::Lit(l.clone())),
+            model::Alt::Type(n) => match catalog.resolve(n) {
+                Some(ty) if ty.rest_of_line() => return Err(format!("`{n}` consumes the rest of the line and cannot be a union alternative")),
+                Some(ty) => resolved.push(Alt::Type(ty)),
+                None => return Err(format!("unknown type `{n}` (define it above, or quote it if it is a literal)")),
+            },
+        }
+    }
+    Ok(resolved)
 }
 
 fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>) -> Result<Compiled> {

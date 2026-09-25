@@ -2,6 +2,9 @@
 # The model records what is literally configured; `remoteAs` is optional because a
 # neighbor may inherit it from a peer template.
 
+# maximum-prefix <limit> [<threshold%>] [warning-only | restart <minutes>]
+type maxPrefix = {{ limit: int(1..4294967295) }} {{ threshold: int(1..100) | "" }} {{ action: "warning-only" | "restart" | "" }} {{ restart: int | "" }}
+
 model NeighborAf
   afi: key string
   safi: key string
@@ -9,7 +12,7 @@ model NeighborAf
   sendCommunityExtended: flag
   routeMapIn: string?
   routeMapOut: string?
-  maximumPrefix: names?
+  maximumPrefix: maxPrefix?
   nextHopSelf: flag
   softReconfigInbound: flag
 

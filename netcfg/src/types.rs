@@ -12,6 +12,10 @@ pub trait Scalar: Send + Sync {
     fn rest_of_line(&self) -> bool {
         false
     }
+    /// May match zero tokens (a union with an `""` alternative).
+    fn allows_empty(&self) -> bool {
+        false
+    }
     /// Read a value from the start of `toks`, returning it and how many tokens were used.
     fn parse(&self, toks: &[&str]) -> Result<(Value, usize), String>;
     fn encode(&self, v: &Value) -> Result<Vec<String>, String>;
@@ -298,26 +302,24 @@ impl UnionType {
         self.alts.iter().map(|a| match a { Alt::Lit(l) => format!("\"{l}\""), Alt::Type(t) => t.name().to_string() }).collect::<Vec<_>>().join(" | ")
     }
 }
-impl UnionType {
-    /// `""` as an alternative means "nothing": the placeholder may be absent at the end of the line.
-    fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l) if l.is_empty())) }
-}
 impl Scalar for UnionType {
     fn name(&self) -> &str { &self.name }
-    /// An empty alternative only makes sense at the end of the line, so it is treated
-    /// like a rest-of-line type: the placeholder must be last.
+    /// `""` as an alternative means "nothing". On a template line such a placeholder must be
+    /// last (only the end of the line is unambiguous); inside a struct type it may sit anywhere.
+    fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l) if l.is_empty())) }
     fn rest_of_line(&self) -> bool { self.allows_empty() }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
-        if t.is_empty() && self.allows_empty() { return Ok((Value::Str(String::new()), 0)); }
-        let w = one(t, &self.name)?;
         for a in &self.alts {
             match a {
-                Alt::Lit(l) if l == w => return Ok((Value::Str(w.to_string()), 1)),
-                Alt::Lit(_) => {}
-                Alt::Type(ty) => if let Ok(r) = ty.parse(t) { return Ok(r); },
+                Alt::Lit(l) if l.is_empty() => return Ok((Value::Str(String::new()), 0)),
+                Alt::Lit(l) => if t.first() == Some(&l.as_str()) { return Ok((Value::Str(l.clone()), 1)); },
+                Alt::Type(ty) => if !t.is_empty() { if let Ok(r) = ty.parse(t) { return Ok(r); } },
             }
         }
-        Err(format!("'{w}' is not a valid {} ({})", self.name, self.describe_alts()))
+        match t.first() {
+            Some(w) => Err(format!("'{w}' is not a valid {} ({})", self.name, self.describe_alts())),
+            None => Err(format!("expected {} ({}), found end of line", self.name, self.describe_alts())),
+        }
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
         for a in &self.alts {
@@ -334,6 +336,70 @@ impl Scalar for UnionType {
         let mut any: Vec<serde_json::Value> = self.alts.iter().filter_map(|a| match a { Alt::Type(t) => Some(t.schema()), _ => None }).collect();
         if !lits.is_empty() { any.push(serde_json::json!({"type": "string", "enum": lits})); }
         if any.len() == 1 { any.pop().unwrap() } else { serde_json::json!({"anyOf": any}) }
+    }
+}
+
+/// One token of a struct type: a literal or a named sub-field.
+pub enum SToken {
+    Lit(String),
+    Field { name: String, ty: ScalarRef },
+}
+
+/// A structured value declared in the template file:
+/// `type maxRoutes = {{ limit: int }} {{ action: "warning-only" | "" }}`.
+/// The value is a record; sub-fields whose type allows "nothing" are omitted when absent.
+pub struct StructType { pub name: String, pub toks: Vec<SToken> }
+impl Scalar for StructType {
+    fn name(&self) -> &str { &self.name }
+    fn rest_of_line(&self) -> bool {
+        matches!(self.toks.last(), Some(SToken::Field { ty, .. }) if ty.rest_of_line())
+    }
+    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        let mut rec = crate::value::Record::new();
+        let mut pos = 0;
+        for tok in &self.toks {
+            match tok {
+                SToken::Lit(l) => {
+                    if t.get(pos) == Some(&l.as_str()) { pos += 1; }
+                    else { return Err(format!("{}: expected `{l}`, found {}", self.name, t.get(pos).map(|w| format!("'{w}'")).unwrap_or_else(|| "end of line".into()))); }
+                }
+                SToken::Field { name, ty } => {
+                    let (v, n) = ty.parse(&t[pos..]).map_err(|e| format!("{}.{name}: {e}", self.name))?;
+                    pos += n;
+                    if !(n == 0 && v.as_str() == Some("")) { rec.insert(name.clone(), v); }
+                }
+            }
+        }
+        Ok((Value::Record(rec), pos))
+    }
+    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
+        let rec = v.as_record().ok_or_else(|| format!("expected an object for {}, got {v:?}", self.name))?;
+        for k in rec.keys() {
+            if !self.toks.iter().any(|t| matches!(t, SToken::Field { name, .. } if name == k)) { return Err(format!("{}: unknown field `{k}`", self.name)); }
+        }
+        let mut out = Vec::new();
+        for tok in &self.toks {
+            match tok {
+                SToken::Lit(l) => out.push(l.clone()),
+                SToken::Field { name, ty } => match rec.get(name) {
+                    Some(x) => out.extend(ty.encode(x).map_err(|e| format!("{}.{name}: {e}", self.name))?),
+                    None if ty.allows_empty() => {}
+                    None => return Err(format!("{}: field `{name}` is missing", self.name)),
+                },
+            }
+        }
+        Ok(out)
+    }
+    fn schema(&self) -> serde_json::Value {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for tok in &self.toks {
+            if let SToken::Field { name, ty } = tok {
+                props.insert(name.clone(), ty.schema());
+                if !ty.allows_empty() { required.push(serde_json::Value::String(name.clone())); }
+            }
+        }
+        serde_json::json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
     }
 }
 
