@@ -247,3 +247,22 @@ fn ipv6_neighbors() {
     assert_eq!(p.value.to_json(), serde_json::json!({"dst": "2001:db8:1::/48", "via": "2001:db8::1"}));
     assert!(e.parse("R", "ip route 2001:db8:1::/129 2001:db8::1\n").unwrap_err().0.contains("expected exactly one R"));
 }
+
+#[test]
+fn optional_trailing_value_via_empty_literal() {
+    let t = "type groupRef = string | \"\"\n\nmodel Nbr\n  peer: key ip\n  group: groupRef?\n  desc: phrase?\n\nmodel Bgp\n  asn: key asn\n  nbrs: [Nbr]\n\ntemplate\n  router bgp {{ asn }}\n    {{ nbrs }}\n";
+    let t = t.replace("model Bgp", "template\n  neighbor {{ peer }} group {{ group }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel Bgp");
+    let e = Engine::from_text("t", &t, Some("eos")).unwrap();
+    let cfg = "router bgp 1\n   neighbor 10.0.0.1 group\n   neighbor 10.0.0.2 group CORE\n   neighbor 10.0.0.3 description no group line\n";
+    let p = e.parse("Bgp", cfg).unwrap();
+    let n = p.value.to_json()["nbrs"].clone();
+    assert_eq!(n[0]["group"], "");
+    assert_eq!(n[1]["group"], "CORE");
+    assert!(n[2].get("group").is_none());
+    assert!(p.unmanaged.is_empty());
+    assert_eq!(e.render("Bgp", &p.value).unwrap(), cfg);
+    // `""` must be the last placeholder on its line.
+    let bad = "type g = string | \"\"\n\nmodel M\n  a: key string\n  b: g\n  c: int\n\ntemplate\n  x {{ a }}\n    y {{ b }} {{ c }}\n";
+    let err = Engine::from_text("t", bad, Some("eos")).unwrap_err();
+    assert!(err.0.contains("`b` consumes the rest of the line, so it must be last"), "{err}");
+}

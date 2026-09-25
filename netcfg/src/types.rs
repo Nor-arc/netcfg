@@ -46,7 +46,11 @@ struct Str;
 impl Scalar for Str {
     fn name(&self) -> &str { "string" }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> { Ok((Value::Str(one(t, "a word")?.to_string()), 1)) }
-    fn encode(&self, v: &Value) -> Result<Vec<String>, String> { Ok(vec![expect_str(v, "string")?.to_string()]) }
+    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
+        let s = expect_str(v, "string")?;
+        if s.is_empty() || s.contains(char::is_whitespace) { return Err(format!("'{s}' is not a single word")); }
+        Ok(vec![s.to_string()])
+    }
     fn schema(&self) -> serde_json::Value { json_str(Some(r"^\S+$"), "one word") }
 }
 
@@ -294,9 +298,17 @@ impl UnionType {
         self.alts.iter().map(|a| match a { Alt::Lit(l) => format!("\"{l}\""), Alt::Type(t) => t.name().to_string() }).collect::<Vec<_>>().join(" | ")
     }
 }
+impl UnionType {
+    /// `""` as an alternative means "nothing": the placeholder may be absent at the end of the line.
+    fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l) if l.is_empty())) }
+}
 impl Scalar for UnionType {
     fn name(&self) -> &str { &self.name }
+    /// An empty alternative only makes sense at the end of the line, so it is treated
+    /// like a rest-of-line type: the placeholder must be last.
+    fn rest_of_line(&self) -> bool { self.allows_empty() }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        if t.is_empty() && self.allows_empty() { return Ok((Value::Str(String::new()), 0)); }
         let w = one(t, &self.name)?;
         for a in &self.alts {
             match a {
@@ -310,6 +322,7 @@ impl Scalar for UnionType {
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
         for a in &self.alts {
             match a {
+                Alt::Lit(l) if l.is_empty() => if v.as_str() == Some("") { return Ok(Vec::new()); },
                 Alt::Lit(l) => if v.as_str() == Some(l.as_str()) { return Ok(vec![l.clone()]); },
                 Alt::Type(ty) => if let Ok(r) = ty.encode(v) { return Ok(r); },
             }

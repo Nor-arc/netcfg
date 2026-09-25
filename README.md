@@ -37,6 +37,7 @@ template
 | `type name = /regex/` | One-token type validated by a regex. |
 | `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
 | `type name = asn \| "auto"` | Union: alternatives tried in order; bare names are types, quoted words are literals. |
+| `type name = string \| ""` | An empty literal matches nothing at the end of the line: a value that may be present without a value (`neighbor X group` vs `neighbor X group CORE`, data `""` vs `"CORE"`). Must be the last placeholder. |
 | `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
 
