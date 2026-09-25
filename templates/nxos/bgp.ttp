@@ -1,0 +1,84 @@
+# NX-OS BGP: nested neighbor blocks with per-address-family settings.
+# The model records what is literally configured; `remoteAs` is optional because a
+# neighbor may inherit it from a peer template.
+
+model NeighborAf
+  afi: key string
+  safi: key string
+  sendCommunity: flag
+  sendCommunityExtended: flag
+  routeMapIn: string?
+  routeMapOut: string?
+  maximumPrefix: names?
+  nextHopSelf: flag
+  softReconfigInbound: flag
+
+template
+  address-family {{ afi }} {{ safi }}
+    send-community {{ sendCommunity }}
+    send-community extended {{ sendCommunityExtended }}
+    route-map {{ routeMapIn }} in
+    route-map {{ routeMapOut }} out
+    maximum-prefix {{ maximumPrefix }}
+    next-hop-self {{ nextHopSelf }}
+    soft-reconfiguration inbound {{ softReconfigInbound }}
+
+model Neighbor
+  peer: key ipv4
+  remoteAs: asn?
+  inheritPeer: string?
+  description: phrase?
+  updateSource: string?
+  ebgpMultihop: int(2..255)?
+  timers: intpair?
+  shutdown: flag
+  addressFamilies: [NeighborAf]
+
+template
+  neighbor {{ peer }}
+    remote-as {{ remoteAs }}
+    inherit peer {{ inheritPeer }}
+    description {{ description }}
+    update-source {{ updateSource }}
+    ebgp-multihop {{ ebgpMultihop }}
+    timers {{ timers }}
+    shutdown {{ shutdown }}
+    {{ addressFamilies }}
+
+model PeerTemplate
+  name: key string
+  remoteAs: asn?
+  description: phrase?
+  updateSource: string?
+  ebgpMultihop: int(2..255)?
+
+template
+  template peer {{ name }}
+    remote-as {{ remoteAs }}
+    description {{ description }}
+    update-source {{ updateSource }}
+    ebgp-multihop {{ ebgpMultihop }}
+
+model Bgp
+  asn: key asn
+  routerId: ipv4?
+  logNeighborChanges: flag
+  peerTemplates: [PeerTemplate]
+  neighbors: [Neighbor]
+
+template
+  router bgp {{ asn }}
+    router-id {{ routerId }}
+    log-neighbor-changes {{ logNeighborChanges }}
+    {{ peerTemplates }}
+    {{ neighbors }}
+
+model Device
+  hostname: string
+  routeMaps: [RouteMapEntry]
+  bgp: [Bgp]
+
+template
+  hostname {{ hostname }}
+  {{ routeMaps }}
+  {{ bgp }}

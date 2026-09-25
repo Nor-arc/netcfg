@@ -1,0 +1,64 @@
+# Templates look like the config they describe, so Junos templates use braces too.
+# Literal-only lines with nested lines (`system {`, `unit 0 {`) are containers: their
+# children are fields of the same model, so a value can live at any depth.
+
+model JunosInterface
+  name: key string
+  description: phrase?
+  address: cidr?
+
+template
+  {{ name }} {
+      description {{ description }};
+      unit 0 {
+          family inet {
+              address {{ address }};
+          }
+      }
+  }
+
+model JunosNeighbor
+  peer: key ipv4
+  description: phrase?
+  peerAs: asn?
+
+template
+  neighbor {{ peer }} {
+      description {{ description }};
+      peer-as {{ peerAs }};
+  }
+
+type peerType = internal | external
+
+model JunosGroup
+  name: key string
+  type: peerType?
+  neighbors: [JunosNeighbor]
+
+template
+  group {{ name }} {
+      type {{ type }};
+      {{ neighbors }}
+  }
+
+model JunosDevice
+  hostname: string?
+  sshEnabled: flag
+  interfaces: [JunosInterface]
+  groups: [JunosGroup]
+
+template
+  system {
+      host-name {{ hostname }};
+      services {
+          ssh {{ sshEnabled }};
+      }
+  }
+  interfaces {
+      {{ interfaces }}
+  }
+  protocols {
+      bgp {
+          {{ groups }}
+      }
+  }

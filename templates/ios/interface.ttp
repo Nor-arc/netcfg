@@ -1,0 +1,45 @@
+type vlanId = /[1-9][0-9]{0,3}/
+
+model Vlan
+  id: key vlanId
+  name: string?
+
+template
+  vlan {{ id }}
+   name {{ name }}
+
+model Interface
+  name: key string
+  description: phrase?
+  address: cidr?
+  mtu: int(576..9216) = 1500
+  accessVlan: vlanId?
+  shutdown: flag
+
+template
+  interface {{ name }}
+   description {{ description }}
+   ip address {{ address }}
+   mtu {{ mtu }}
+   switchport access vlan {{ accessVlan }}
+   shutdown {{ shutdown }}
+   @ignore ip address * * secondary
+
+model StaticRoute
+  prefix: key cidr
+  nextHop: key ipv4
+
+template
+  ip route {{ prefix }} {{ nextHop }}
+
+model Device
+  hostname: string
+  vlans: [Vlan]
+  interfaces: [Interface]
+  routes: [StaticRoute]
+
+template
+  hostname {{ hostname }}
+  {{ vlans }}
+  {{ interfaces }}
+  {{ routes }}

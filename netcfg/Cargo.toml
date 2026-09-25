@@ -1,0 +1,27 @@
+[package]
+name = "netcfg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Bidirectional network config templates: parse running configs into models and render them back"
+
+[lib]
+name = "netcfg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "netcfg"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["clap"]
+
+[dependencies]
+indexmap = "=2.1.0"
+regex = "=1.10.2"
+serde = { version = "=1.0.195", features = ["derive"] }
+serde_json = { version = "=1.0.111", features = ["preserve_order"] }
+serde_yaml = "=0.9.30"
+clap = { version = "=4.4.18", features = ["derive"], optional = true }

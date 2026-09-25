@@ -1,0 +1,30 @@
+# Route-map entries. Identity is (name, seq); the action is an ordinary value on the
+# header line, so permit -> deny is an edit rather than a delete + add.
+
+type action = permit | deny
+
+model RouteMapEntry
+  name: key string
+  action: action
+  seq: key int
+  description: phrase?
+  matchPrefixLists: names?
+  matchAcl: string?
+  matchCommunity: string?
+  matchAsPath: string?
+  setLocalPref: int?
+  setMetric: int?
+  setCommunity: names?
+  prependAsPath: ints?
+
+template
+  route-map {{ name }} {{ action }} {{ seq }}
+    description {{ description }}
+    match ip address prefix-list {{ matchPrefixLists }}
+    match ip address {{ matchAcl }}
+    match community {{ matchCommunity }}
+    match as-path {{ matchAsPath }}
+    set local-preference {{ setLocalPref }}
+    set metric {{ setMetric }}
+    set community {{ setCommunity }}
+    set as-path prepend {{ prependAsPath }}

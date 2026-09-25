@@ -1,0 +1,49 @@
+//! JSON Schema generation from model declarations, so YAML/JSON data gets editor
+//! completion and validation from the same source the parser uses.
+
+use crate::engine::{Compiled, Engine};
+use crate::model::Kind;
+use serde_json::{json, Map, Value as J};
+
+impl Engine {
+    /// A self-contained JSON Schema (draft 2020-12) for `model`, with every referenced
+    /// model under `$defs`.
+    pub fn schema(&self, model: &str) -> crate::Result<J> {
+        let root = self.model(model).ok_or_else(|| crate::Error(format!("unknown model `{model}`")))?;
+        let mut defs = Map::new();
+        let mut todo = vec![root];
+        while let Some(m) = todo.pop() {
+            if defs.contains_key(&m.name) { continue; }
+            defs.insert(m.name.clone(), self.model_schema(m));
+            for f in m.fields.iter().filter(|f| f.kind == Kind::Many) {
+                if let Some(sub) = self.model(&f.type_spec) { todo.push(sub); }
+            }
+        }
+        Ok(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/$defs/{}", model),
+            "$defs": defs,
+        }))
+    }
+
+    fn model_schema(&self, m: &Compiled) -> J {
+        let mut props = Map::new();
+        let mut required = Vec::new();
+        for (i, f) in m.fields.iter().enumerate() {
+            let s = match f.kind {
+                Kind::Flag => json!({"type": "boolean", "default": f.default.as_ref().map(|d| d[0] == "true").unwrap_or(false)}),
+                Kind::Many => json!({"type": "array", "items": {"$ref": format!("#/$defs/{}", f.type_spec)}}),
+                _ => {
+                    let mut s = m.field_type(i).map(|t| t.schema()).unwrap_or(json!({}));
+                    if let (Some(d), Some(o)) = (&f.default, s.as_object_mut()) {
+                        o.insert("default".into(), J::String(d.join(" ")));
+                    }
+                    s
+                }
+            };
+            props.insert(f.name.clone(), s);
+            if matches!(f.kind, Kind::Key | Kind::Scalar) && f.default.is_none() { required.push(J::String(f.name.clone())); }
+        }
+        json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+    }
+}

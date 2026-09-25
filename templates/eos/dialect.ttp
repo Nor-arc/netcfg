@@ -1,0 +1,3 @@
+dialect eos
+  extends: cisco
+  indent: 3

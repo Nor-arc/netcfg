@@ -1,0 +1,6 @@
+dialect ios
+  extends: cisco
+  indent: 1
+  block-separator: !
+  end-marker: end
+  cidr: masked

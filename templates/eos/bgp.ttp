@@ -1,0 +1,53 @@
+# Arista EOS writes neighbor settings as flat lines under `router bgp`, each repeating the
+# neighbor address. A model whose template has several top-level lines that all carry its
+# key is a flat keyed group: lines are grouped into one value per key.
+
+model EosNeighbor
+  peer: key ipv4
+  remoteAs: asn?
+  peerGroup: string?
+  description: phrase?
+  updateSource: string?
+  ebgpMultihop: int(2..255)?
+  timers: intpair?
+  routeMapIn: string?
+  routeMapOut: string?
+  maximumRoutes: int?
+  sendCommunity: flag
+  nextHopSelf: flag
+  shutdown: flag
+
+template
+  neighbor {{ peer }} remote-as {{ remoteAs }}
+  neighbor {{ peer }} peer group {{ peerGroup }}
+  neighbor {{ peer }} description {{ description }}
+  neighbor {{ peer }} update-source {{ updateSource }}
+  neighbor {{ peer }} ebgp-multihop {{ ebgpMultihop }}
+  neighbor {{ peer }} timers {{ timers }}
+  neighbor {{ peer }} route-map {{ routeMapIn }} in
+  neighbor {{ peer }} route-map {{ routeMapOut }} out
+  neighbor {{ peer }} maximum-routes {{ maximumRoutes }}
+  neighbor {{ peer }} send-community {{ sendCommunity }}
+  neighbor {{ peer }} next-hop-self {{ nextHopSelf }}
+  neighbor {{ peer }} shutdown {{ shutdown }}
+  @ignore neighbor * password
+
+model EosBgp
+  asn: key asn
+  routerId: ipv4?
+  neighbors: [EosNeighbor]
+
+template
+  router bgp {{ asn }}
+    router-id {{ routerId }}
+    {{ neighbors }}
+
+model EosDevice
+  hostname: string
+  routeMaps: [RouteMapEntry]
+  bgp: [EosBgp]
+
+template
+  hostname {{ hostname }}
+  {{ routeMaps }}
+  {{ bgp }}
