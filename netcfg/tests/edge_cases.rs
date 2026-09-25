@@ -208,3 +208,42 @@ fn template_validation_reports_everything() {
     let err = Engine::from_text("bad2.ttp", bad2, Some("ios")).unwrap_err().0;
     assert!(err.contains("needs at least one key field"), "{err}");
 }
+
+#[test]
+fn union_and_list_types() {
+    let s = Suite::new("nxos", "Device", NX);
+    // asn | "auto", as a rest-of-line list
+    s.parses_to(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend 65000 65000\n"), |j| j["routeMaps"][1]["prependAsPath"] == serde_json::json!([65000, 65000]));
+    s.parses_to(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend auto\n"), |j| j["routeMaps"][1]["prependAsPath"] == serde_json::json!(["auto"]));
+    s.parses_to(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend 1.10 auto\n"), |j| j["routeMaps"][1]["prependAsPath"] == serde_json::json!([65546, "auto"]));
+    s.fails(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend banana\n"), "'banana' is not a valid prependItem (asn | \"auto\")");
+    s.fails(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend 65000 banana\n"), "banana");
+    s.round_trip(&s.rep("route-map RM-IN deny 20\n", "route-map RM-IN deny 20\n  set as-path prepend 65000 auto\n"));
+    // rendering validates too
+    let mut v = s.base_parsed.value.to_json();
+    v["routeMaps"][1]["prependAsPath"] = serde_json::json!([65000, "nope"]);
+    let err = s.e.render("Device", &Value::from_json(&v)).unwrap_err();
+    assert!(err.0.contains("not a valid prependItem"), "{err}");
+    // schema
+    let sch = s.e.schema("Device").unwrap();
+    assert_eq!(sch["$defs"]["RouteMapEntry"]["properties"]["prependAsPath"]["items"]["anyOf"][1]["enum"], serde_json::json!(["auto"]));
+    // a bare unknown word in a union is an error, with a hint
+    let err = Engine::from_text("t", "type x = asn | auto\nmodel M\n  a: x\n\ntemplate\n  a {{ a }}\n", Some("nxos")).unwrap_err();
+    assert!(err.0.contains("unknown type `auto`") && err.0.contains("quote it"), "{err}");
+}
+
+#[test]
+fn ipv6_neighbors() {
+    let s = Suite::new("nxos", "Device", NX);
+    let text = s.append("  neighbor 2001:DB8:0:0:0:0:0:1\n    remote-as 65010\n    address-family ipv6 unicast\n      route-map RM-IN in\n");
+    s.parses_to(&text, |j| j["bgp"][0]["neighbors"][1]["peer"] == "2001:db8::1" && j["bgp"][0]["neighbors"][1]["addressFamilies"][0]["afi"] == "ipv6");
+    s.round_trip(&text);
+    let out = s.e.render("Device", &s.e.parse("Device", &text).unwrap().value).unwrap();
+    assert!(out.contains("  neighbor 2001:db8::1\n    remote-as 65010\n"), "{out}");
+    // Neither family: the header doesn't decode, so it is not ours.
+    s.unmanaged(&s.append("  neighbor 2001:db8::zz\n    remote-as 1\n"), "router bgp 65000 > neighbor 2001:db8::zz > remote-as 1");
+    let e = Engine::from_text("t", "model R\n  dst: key prefix\n  via: key ip\n\ntemplate\n  ip route {{ dst }} {{ via }}\n", Some("nxos")).unwrap();
+    let p = e.parse("R", "ip route 2001:db8:1::/48 2001:db8::1\n").unwrap();
+    assert_eq!(p.value.to_json(), serde_json::json!({"dst": "2001:db8:1::/48", "via": "2001:db8::1"}));
+    assert!(e.parse("R", "ip route 2001:db8:1::/129 2001:db8::1\n").unwrap_err().0.contains("expected exactly one R"));
+}

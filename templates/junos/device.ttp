@@ -18,7 +18,7 @@ template
   }
 
 model JunosNeighbor
-  peer: key ipv4
+  peer: key ip
   description: phrase?
   peerAs: asn?
 
@@ -28,7 +28,7 @@ template
       peer-as {{ peerAs }};
   }
 
-type peerType = internal | external
+type peerType = "internal" | "external"
 
 model JunosGroup
   name: key string

@@ -35,10 +35,12 @@ template
 | `f: flag` / `f: flag = true` | Presence of a literal line; `no <line>` is `false`. |
 | `f: [Model]` | A keyed collection; `{{ f }}` alone on a line stands for all of its blocks/lines. |
 | `type name = /regex/` | One-token type validated by a regex. |
-| `type name = a \| b` | Enumeration of literal tokens. |
+| `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
+| `type name = asn \| "auto"` | Union: alternatives tried in order; bare names are types, quoted words are literals. |
+| `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
 
-Builtin types: `string`, `int`, `int(lo..hi)`, `ipv4`, `cidr` (dialect-dependent: `addr/len` on NX-OS/EOS, `addr mask` on IOS; the value is always `addr/len`), `asn` (asplain or asdot in, asplain out), `intpair`, and the rest-of-line types `phrase`, `names`, `ints`. Domain types with real parsing logic are added in Rust by implementing the `Scalar` trait.
+Builtin types: `string`, `int`, `int(lo..hi)`, `list(T)`, `ipv4`, `ipv6`, `ip` (either), `cidr` (dialect-dependent: `addr/len` on NX-OS/EOS, `addr mask` on IOS; the value is always `addr/len`), `ipv6cidr`, `prefix` (either), `asn` (asplain or asdot in, asplain out), `intpair`, and the rest-of-line types `phrase`, `names`, `ints`. Domain types with real parsing logic are added in Rust by implementing the `Scalar` trait.
 
 Template shapes are inferred: one header line with nested lines is a **block**; several sibling lines that all carry the key are a **flat group** (EOS/IOS `neighbor X …` lines); a model without keys is a **root** document.
 
@@ -97,6 +99,8 @@ netcfg bench   templates/nxos running.cfg --model Device --runs 5
 ```
 pip install maturin && cd netcfg-py && maturin build --release   # wheel in target/wheels
 ```
+Bindings use pyo3 0.22, which supports CPython 3.7–3.13. For Python 3.14 bump `pyo3` in
+`netcfg-py/Cargo.toml` to 0.25 or later (the Bound API used here is unchanged).
 ```python
 import netcfg
 e = netcfg.Engine("templates/nxos")            # dialect comes from the templates' declaration

@@ -9,7 +9,7 @@ use crate::dialect::Dialect;
 use crate::lexer::{Node, OwnedNode};
 use crate::model::{self, FieldDef, Kind, TypeBody};
 use crate::template::{self, Shape, TLine, Tok};
-use crate::types::{Catalog, EnumType, RegexType, ScalarRef};
+use crate::types::{Alt, Catalog, RegexType, ScalarRef, UnionType};
 use crate::value::{Record, Value};
 use crate::{Error, Result};
 use indexmap::IndexMap;
@@ -173,7 +173,20 @@ impl Engine {
             if catalog.get(&t.name).is_some() { errors.push(format!("type `{}` (line {}) is already defined", t.name, t.line)); continue; }
             match &t.def {
                 TypeBody::Regex(r) => catalog.add(Arc::new(RegexType { name: t.name.clone(), source: r.clone(), re: regex::Regex::new(&format!("^(?:{r})$")).map_err(|e| Error(e.to_string()))? })),
-                TypeBody::Enum(o) => catalog.add(Arc::new(EnumType { name: t.name.clone(), options: o.clone() })),
+                TypeBody::Union(alts) => {
+                    let mut resolved = Vec::new();
+                    for a in alts {
+                        match a {
+                            model::Alt::Lit(l) => resolved.push(Alt::Lit(l.clone())),
+                            model::Alt::Type(n) => match catalog.resolve(n) {
+                                Some(ty) if ty.rest_of_line() => errors.push(format!("type `{}` (line {}): `{n}` consumes the rest of the line and cannot be a union alternative", t.name, t.line)),
+                                Some(ty) => resolved.push(Alt::Type(ty)),
+                                None => errors.push(format!("type `{}` (line {}): unknown type `{n}` (define it above, or quote it if it is a literal)", t.name, t.line)),
+                            },
+                        }
+                    }
+                    catalog.add(Arc::new(UnionType { name: t.name.clone(), alts: resolved }));
+                }
             }
         }
         let defs: Vec<&model::ModelDef> = files.iter().flat_map(|f| f.models.iter()).collect();

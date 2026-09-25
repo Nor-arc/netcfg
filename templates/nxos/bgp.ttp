@@ -24,7 +24,7 @@ template
     soft-reconfiguration inbound {{ softReconfigInbound }}
 
 model Neighbor
-  peer: key ipv4
+  peer: key ip
   remoteAs: asn?
   inheritPeer: string?
   description: phrase?

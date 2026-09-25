@@ -56,7 +56,14 @@ pub struct TypeDef {
 #[derive(Debug, Clone)]
 pub enum TypeBody {
     Regex(String),
-    Enum(Vec<String>),
+    /// Alternatives tried in order: `"literal"` tokens or references to other types.
+    Union(Vec<Alt>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Alt {
+    Lit(String),
+    Type(String),
 }
 
 #[derive(Debug, Clone)]
@@ -174,9 +181,18 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
                             Err(e) => { err(&mut errors, ln, format!("invalid regex for type `{name}`: {e}")); continue; }
                         }
                     } else {
-                        let opts: Vec<String> = body.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                        if opts.is_empty() { err(&mut errors, ln, format!("type `{name}` needs at least one option")); continue; }
-                        TypeBody::Enum(opts)
+                        let mut alts = Vec::new();
+                        for part in body.split('|').map(str::trim).filter(|s| !s.is_empty()) {
+                            if let Some(lit) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                                alts.push(Alt::Lit(lit.to_string()));
+                            } else if is_ident(part) || part.starts_with("int(") || part.starts_with("list(") {
+                                alts.push(Alt::Type(part.to_string()));
+                            } else {
+                                err(&mut errors, ln, format!("type `{name}`: `{part}` is neither a type name nor a \"quoted\" literal"));
+                            }
+                        }
+                        if alts.is_empty() { err(&mut errors, ln, format!("type `{name}` needs at least one alternative")); continue; }
+                        TypeBody::Union(alts)
                     };
                     file.types.push(TypeDef { name: name.to_string(), def, line: ln });
                 }
@@ -264,7 +280,7 @@ mod tests {
 
     #[test]
     fn parses_a_model() {
-        let f = parse("t.ttp", "type action = permit | deny\n\nmodel Rm\n  name: key string\n  action: action\n  seq: key int\n  desc: phrase?\n  shut: flag = true\n  kids: [Kid]\n\ntemplate\n  route-map {{ name }} {{ action }} {{ seq }}\n    description {{ desc }}\n").unwrap();
+        let f = parse("t.ttp", "type action = \"permit\" | \"deny\"\n\nmodel Rm\n  name: key string\n  action: action\n  seq: key int\n  desc: phrase?\n  shut: flag = true\n  kids: [Kid]\n\ntemplate\n  route-map {{ name }} {{ action }} {{ seq }}\n    description {{ desc }}\n").unwrap();
         assert_eq!(f.types.len(), 1);
         let m = &f.models[0];
         assert_eq!(m.fields.len(), 6);

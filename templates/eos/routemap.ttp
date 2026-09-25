@@ -1,7 +1,9 @@
 # Route-map entries. Identity is (name, seq); the action is an ordinary value on the
 # header line, so permit -> deny is an edit rather than a delete + add.
 
-type action = permit | deny
+type action = "permit" | "deny"
+# An AS to prepend, or the literal `auto`: alternatives are tried in order.
+type prependItem = asn | "auto"
 
 model RouteMapEntry
   name: key string
@@ -15,7 +17,7 @@ model RouteMapEntry
   setLocalPref: int?
   setMetric: int?
   setCommunity: names?
-  prependAsPath: ints?
+  prependAsPath: list(prependItem)?
 
 template
   route-map {{ name }} {{ action }} {{ seq }}

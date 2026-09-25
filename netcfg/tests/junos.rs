@@ -112,7 +112,7 @@ fn strict_inside_containers() {
     let err = e.parse("JunosDevice", "system {\n    host-name r1 extra;\n}\n").unwrap_err();
     assert!(err.0.contains("host-name r1 extra"), "{err}");
     let err = e.parse("JunosDevice", "protocols {\n    bgp {\n        group EXT {\n            type weird;\n        }\n    }\n}\n").unwrap_err();
-    assert!(err.0.contains("not one of internal|external"), "{err}");
+    assert!(err.0.contains("not a valid peerType"), "{err}");
     // An absent container just means every field in it is absent.
     let p = e.parse("JunosDevice", "interfaces {\n    lo0 {\n        description \"loopback\";\n    }\n}\n").unwrap();
     let j = p.value.to_json();

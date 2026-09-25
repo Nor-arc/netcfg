@@ -130,6 +130,48 @@ impl Scalar for Cidr {
     fn schema(&self) -> serde_json::Value { json_str(Some(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$"), "IPv4 prefix, addr/len") }
 }
 
+/// IPv6 address, canonicalised per RFC 5952 (lowercase, longest zero run compressed).
+struct Ipv6;
+fn parse_ipv6(s: &str) -> Option<std::net::Ipv6Addr> {
+    // Reject IPv4-mapped/compat spellings that std accepts but devices don't print.
+    if s.contains('%') { return None; }
+    s.parse::<std::net::Ipv6Addr>().ok()
+}
+impl Scalar for Ipv6 {
+    fn name(&self) -> &str { "ipv6" }
+    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        let w = one(t, "an IPv6 address")?;
+        let a = parse_ipv6(w).ok_or_else(|| format!("'{w}' is not an IPv6 address"))?;
+        Ok((Value::Str(a.to_string()), 1))
+    }
+    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
+        let s = expect_str(v, "ipv6")?;
+        parse_ipv6(s).map(|a| vec![a.to_string()]).ok_or_else(|| format!("'{s}' is not an IPv6 address"))
+    }
+    fn schema(&self) -> serde_json::Value { json_str(Some(r"^[0-9A-Fa-f:.]+$"), "IPv6 address") }
+}
+
+/// `addr/len` IPv6 prefix; the address part is canonicalised.
+struct Ipv6Cidr;
+fn parse_ipv6_cidr(w: &str) -> Option<String> {
+    let (a, l) = w.split_once('/')?;
+    let a = parse_ipv6(a)?;
+    let l: u32 = l.parse().ok().filter(|l| *l <= 128)?;
+    Some(format!("{a}/{l}"))
+}
+impl Scalar for Ipv6Cidr {
+    fn name(&self) -> &str { "ipv6cidr" }
+    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        let w = one(t, "an IPv6 prefix")?;
+        Ok((Value::Str(parse_ipv6_cidr(w).ok_or_else(|| format!("'{w}' is not an IPv6 prefix (addr/len)"))?), 1))
+    }
+    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
+        let s = expect_str(v, "ipv6cidr")?;
+        parse_ipv6_cidr(s).map(|c| vec![c]).ok_or_else(|| format!("'{s}' is not an IPv6 prefix (addr/len)"))
+    }
+    fn schema(&self) -> serde_json::Value { json_str(Some(r"^[0-9A-Fa-f:.]+/\d{1,3}$"), "IPv6 prefix, addr/len") }
+}
+
 /// BGP AS number: asplain or asdot on input, asplain on output.
 struct Asn;
 fn parse_asn(w: &str) -> Option<i64> {
@@ -238,19 +280,75 @@ impl Scalar for RegexType {
     fn schema(&self) -> serde_json::Value { json_str(Some(&format!("^{}$", self.source)), &self.name) }
 }
 
-/// A user-defined enumeration of literal tokens (`type action = permit | deny`).
-pub struct EnumType { pub name: String, pub options: Vec<String> }
-impl Scalar for EnumType {
+/// One alternative of a union: a literal token or another type.
+pub enum Alt {
+    Lit(String),
+    Type(ScalarRef),
+}
+
+/// A user-defined disjunction: `type action = "permit" | "deny"`,
+/// `type prependItem = asn | "auto"`. Alternatives are tried in order.
+pub struct UnionType { pub name: String, pub alts: Vec<Alt> }
+impl UnionType {
+    fn describe_alts(&self) -> String {
+        self.alts.iter().map(|a| match a { Alt::Lit(l) => format!("\"{l}\""), Alt::Type(t) => t.name().to_string() }).collect::<Vec<_>>().join(" | ")
+    }
+}
+impl Scalar for UnionType {
     fn name(&self) -> &str { &self.name }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         let w = one(t, &self.name)?;
-        if self.options.iter().any(|o| o == w) { Ok((Value::Str(w.to_string()), 1)) } else { Err(format!("'{w}' is not one of {}", self.options.join("|"))) }
+        for a in &self.alts {
+            match a {
+                Alt::Lit(l) if l == w => return Ok((Value::Str(w.to_string()), 1)),
+                Alt::Lit(_) => {}
+                Alt::Type(ty) => if let Ok(r) = ty.parse(t) { return Ok(r); },
+            }
+        }
+        Err(format!("'{w}' is not a valid {} ({})", self.name, self.describe_alts()))
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        let s = expect_str(v, &self.name)?;
-        if self.options.iter().any(|o| o == s) { Ok(vec![s.to_string()]) } else { Err(format!("'{s}' is not one of {}", self.options.join("|"))) }
+        for a in &self.alts {
+            match a {
+                Alt::Lit(l) => if v.as_str() == Some(l.as_str()) { return Ok(vec![l.clone()]); },
+                Alt::Type(ty) => if let Ok(r) = ty.encode(v) { return Ok(r); },
+            }
+        }
+        Err(format!("{v:?} is not a valid {} ({})", self.name, self.describe_alts()))
     }
-    fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "string", "enum": self.options}) }
+    fn schema(&self) -> serde_json::Value {
+        let lits: Vec<&str> = self.alts.iter().filter_map(|a| match a { Alt::Lit(l) => Some(l.as_str()), _ => None }).collect();
+        let mut any: Vec<serde_json::Value> = self.alts.iter().filter_map(|a| match a { Alt::Type(t) => Some(t.schema()), _ => None }).collect();
+        if !lits.is_empty() { any.push(serde_json::json!({"type": "string", "enum": lits})); }
+        if any.len() == 1 { any.pop().unwrap() } else { serde_json::json!({"anyOf": any}) }
+    }
+}
+
+/// `list(T)`: one or more `T` to the end of the line, as a list.
+pub struct ListType { pub elem: ScalarRef }
+impl Scalar for ListType {
+    fn name(&self) -> &str { "list" }
+    fn describe(&self) -> String { format!("list({})", self.elem.name()) }
+    fn rest_of_line(&self) -> bool { true }
+    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        if t.is_empty() { return Err(format!("expected one or more {}", self.elem.name())); }
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < t.len() {
+            let (v, n) = self.elem.parse(&t[pos..])?;
+            out.push(v);
+            pos += n;
+        }
+        Ok((Value::List(out), pos))
+    }
+    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
+        let l = v.as_list().ok_or_else(|| format!("expected a list of {}, got {v:?}", self.elem.name()))?;
+        if l.is_empty() { return Err(format!("list of {} must not be empty", self.elem.name())); }
+        let mut out = Vec::new();
+        for x in l { out.extend(self.elem.encode(x)?); }
+        Ok(out)
+    }
+    fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "array", "items": self.elem.schema(), "minItems": 1}) }
 }
 
 // ---- catalog -------------------------------------------------------------------------------
@@ -271,6 +369,12 @@ impl Catalog {
         c.add(Arc::new(Int { min: i64::MIN, max: i64::MAX }));
         c.add(Arc::new(Ipv4));
         c.add(Arc::new(Cidr { masked: masked_cidr }));
+        c.add(Arc::new(Ipv6));
+        c.add(Arc::new(Ipv6Cidr));
+        // Either family: handy for BGP neighbors and static routes.
+        let ip: ScalarRef = Arc::new(UnionType { name: "ip".into(), alts: vec![Alt::Type(Arc::new(Ipv4)), Alt::Type(Arc::new(Ipv6))] });
+        c.add(ip);
+        c.add(Arc::new(UnionType { name: "prefix".into(), alts: vec![Alt::Type(Arc::new(Cidr { masked: masked_cidr })), Alt::Type(Arc::new(Ipv6Cidr))] }));
         c.add(Arc::new(Asn));
         c.add(Arc::new(Phrase));
         c.add(Arc::new(Names));
@@ -282,11 +386,18 @@ impl Catalog {
     pub fn get(&self, name: &str) -> Option<&ScalarRef> { self.types.get(name) }
     pub fn names(&self) -> Vec<&str> { let mut v: Vec<&str> = self.types.keys().map(String::as_str).collect(); v.sort(); v }
 
-    /// `int(576..9216)`: a bounded integer, created on demand.
+    /// `int(576..9216)` and `list(T)` are created on demand from their spec.
     pub fn resolve(&self, spec: &str) -> Option<ScalarRef> {
         if let Some(t) = self.get(spec) { return Some(t.clone()); }
-        let inner = spec.strip_prefix("int(")?.strip_suffix(')')?;
-        let (a, b) = inner.split_once("..")?;
-        Some(Arc::new(Int { min: a.trim().parse().ok()?, max: b.trim().parse().ok()? }))
+        if let Some(inner) = spec.strip_prefix("int(").and_then(|s| s.strip_suffix(')')) {
+            let (a, b) = inner.split_once("..")?;
+            return Some(Arc::new(Int { min: a.trim().parse().ok()?, max: b.trim().parse().ok()? }));
+        }
+        if let Some(inner) = spec.strip_prefix("list(").and_then(|s| s.strip_suffix(')')) {
+            let elem = self.resolve(inner.trim())?;
+            if elem.rest_of_line() { return None; }
+            return Some(Arc::new(ListType { elem }));
+        }
+        None
     }
 }

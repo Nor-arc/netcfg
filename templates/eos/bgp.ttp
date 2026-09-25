@@ -3,7 +3,7 @@
 # key is a flat keyed group: lines are grouped into one value per key.
 
 model EosNeighbor
-  peer: key ipv4
+  peer: key ip
   remoteAs: asn?
   peerGroup: string?
   description: phrase?
