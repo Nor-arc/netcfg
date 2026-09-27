@@ -300,7 +300,6 @@ fn reference_declaration_errors() {
     let err = |from: &str, to: &str| Engine::from_text("t.nct", &REFS.replace(from, to), Some("nxos")).unwrap_err().0;
     assert!(err("references Rm.name", "references Nope.name").contains("field `routeMapIn`: references unknown model `Nope`"));
     assert!(err("references Rm.name", "references Rm.nam").contains("Rm has no field `nam`"));
-    assert!(err("  seq: key int\n", "  seq: key int\n  desc: string?\n").is_empty() || true);
     assert!(err("references Rm.name", "references Rm").contains("must name a model and its key field: `references Model.field`"));
     let e = err("  routeMapIn: string? references Rm.name", "  routeMapIn: flag references Rm.name").to_string();
     assert!(e.contains("only optional or required value fields can reference another model"), "{e}");

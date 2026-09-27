@@ -220,5 +220,5 @@ impl Engine {
 
 /// `*.test.nct` files under `dir`, recursively, sorted.
 pub fn test_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(crate::set::glob(dir, "**/*.test.nct")?)
+    crate::set::glob(dir, "**/*.test.nct")
 }

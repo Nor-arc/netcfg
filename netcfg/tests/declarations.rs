@@ -78,7 +78,7 @@ fn mapped_enum() {
     let t = "type state = \"up\" -> true | \"down\" -> false\ntype speed = \"auto\" -> 0 | \"fast\" -> 100 | \"gig\" -> \"1g\"\n\nmodel P\n  name: key string\n  admin: state?\n  speed: speed?\n  match: {{ exact: \"exact-match\" -> true | \"\" -> false }} {{ names: list(string) }}?\n\ntemplate P\n  port {{ name }}\n    admin {{ admin }}\n    speed {{ speed }}\n    match {{ match }}\n";
     let e = eng(t, "nxos");
     let cfg = "port 1\n  admin up\n  speed gig\n  match exact-match A B\nport 2\n  admin down\n  speed auto\n  match A\n";
-    let get = |c: &str| e.parse("P", &format!("{c}")).map(|p| p.value.to_json());
+    let get = |c: &str| e.parse("P", c).map(|p| p.value.to_json());
     let first = cfg.split("port 2").next().unwrap();
     assert_eq!(get(first).unwrap(), json!({"name": "1", "admin": true, "speed": "1g", "match": {"names": ["A", "B"], "exact": true}}));
     let second = format!("port 2{}", cfg.split("port 2").nth(1).unwrap());

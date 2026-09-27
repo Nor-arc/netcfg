@@ -20,7 +20,7 @@ pub trait Scalar: Send + Sync {
     fn parse(&self, toks: &[&str]) -> Result<(Value, usize), String>;
     /// `parse`, but a type that would consume a variable number of tokens (a list) stops
     /// before any token in `stop`: the literals that follow it inside a struct type.
-    fn parse_until(&self, toks: &[&str], stop: &[&str]) -> Result<(Value, usize), String> {
+    fn parse_until(&self, toks: &[&str], stop: &[String]) -> Result<(Value, usize), String> {
         let _ = stop;
         self.parse(toks)
     }
@@ -333,22 +333,30 @@ pub enum SToken {
 /// A structured value declared in the template file:
 /// `type maxRoutes = {{ limit: int }} {{ action: "warning-only" | "" }}`.
 /// The value is a record; sub-fields whose type allows "nothing" are omitted when absent.
-pub struct StructType { pub name: String, pub toks: Vec<SToken> }
+pub struct StructType {
+    pub name: String,
+    pub toks: Vec<SToken>,
+    /// Per token, the literals that may follow it (see `new`).
+    stops: Vec<Vec<String>>,
+}
 impl StructType {
-    /// Literals that may come next from token `from` on: literal tokens, and the literals of
-    /// placeholders up to and including the first one that cannot match nothing.
-    fn stop_words(&self, from: usize) -> Vec<&str> {
-        let mut out = Vec::new();
-        for tok in &self.toks[from..] {
-            match tok {
-                SToken::Lit(l) => { out.push(l.as_str()); break; }
-                SToken::Field { ty, .. } => {
-                    out.extend(ty.literals());
-                    if !ty.allows_empty() { break; }
+    pub fn new(name: String, toks: Vec<SToken>) -> StructType {
+        // Literals that may come after token `i`: literal tokens, and the literals of
+        // placeholders up to and including the first one that cannot match nothing.
+        let stops = (0..toks.len()).map(|i| {
+            let mut out = Vec::new();
+            for tok in &toks[i + 1..] {
+                match tok {
+                    SToken::Lit(l) => { out.push(l.clone()); break; }
+                    SToken::Field { ty, .. } => {
+                        out.extend(ty.literals().into_iter().map(String::from));
+                        if !ty.allows_empty() { break; }
+                    }
                 }
             }
-        }
-        out
+            out
+        }).collect();
+        StructType { name, toks, stops }
     }
 }
 impl Scalar for StructType {
@@ -369,8 +377,7 @@ impl Scalar for StructType {
                     else { return Err(format!("{}: expected `{l}`, found {}", self.name, t.get(pos).map(|w| format!("'{w}'")).unwrap_or_else(|| "end of line".into()))); }
                 }
                 SToken::Field { name, ty } => {
-                    let stop = self.stop_words(i + 1);
-                    let (v, n) = ty.parse_until(&t[pos..], &stop).map_err(|e| format!("{}.{name}: {e}", self.name))?;
+                    let (v, n) = ty.parse_until(&t[pos..], &self.stops[i]).map_err(|e| format!("{}.{name}: {e}", self.name))?;
                     pos += n;
                     if !(n == 0 && v.as_str() == Some("")) { rec.insert(name.clone(), v); }
                 }
@@ -421,8 +428,8 @@ impl Scalar for ListType {
     }
     /// Stops before a stop word; a token that is both an element and a stop word is taken as
     /// the stop word.
-    fn parse_until(&self, t: &[&str], stop: &[&str]) -> Result<(Value, usize), String> {
-        let end = t.iter().position(|w| stop.contains(w)).unwrap_or(t.len());
+    fn parse_until(&self, t: &[&str], stop: &[String]) -> Result<(Value, usize), String> {
+        let end = t.iter().position(|w| stop.iter().any(|s| s == w)).unwrap_or(t.len());
         let t = &t[..end];
         if t.is_empty() { return Err(format!("expected one or more {}", self.elem.name())); }
         let mut out = Vec::new();

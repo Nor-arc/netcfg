@@ -147,7 +147,9 @@ impl Engine {
         for n in unmanaged { leaves(n, &mut Vec::new(), &mut paths); }
         generalize(&mut paths);
         // Group leaves by their generalized ancestors, in first-seen order.
-        let mut by_anc: Vec<(Vec<Vec<String>>, Vec<Vec<String>>)> = Vec::new();
+        // Leaves grouped by their generalized ancestors, in first-seen order.
+        type Lines = Vec<Vec<String>>;
+        let mut by_anc: Vec<(Lines, Lines)> = Vec::new();
         for (anc, leaf) in paths {
             match by_anc.iter_mut().find(|(a, _)| *a == anc) {
                 Some((_, ls)) => ls.push(leaf),

@@ -524,7 +524,7 @@ fn struct_type(catalog: &Catalog, name: &str, toks: &[model::StructTok]) -> Resu
             }
         }
     }
-    Ok(Arc::new(StructType { name: name.to_string(), toks: out }))
+    Ok(Arc::new(StructType::new(name.to_string(), out)))
 }
 
 fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<Vec<Alt>, String> {
@@ -1052,7 +1052,7 @@ impl Engine {
         let mut errs = Vec::new();
         let nodes = match value.as_record() {
             Some(rec) => {
-                let nodes = self.render_one(&self.models[mi], rec, model, mode, &mut errs);
+                let nodes = self.render_one(&self.models[mi], rec, &DataPath::Root(model), mode, &mut errs);
                 errs.extend(self.check_references(&self.models[mi], rec));
                 nodes
             }
@@ -1130,7 +1130,7 @@ impl Engine {
 
     /// Render one record of `m`. `path` locates it in the data (`Device.bgp[0]`); problems are
     /// pushed to `errs` and the offending part is skipped.
-    pub(crate) fn render_one(&self, m: &Compiled, rec: &Record, path: &str, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+    pub(crate) fn render_one(&self, m: &Compiled, rec: &Record, path: &DataPath<'_>, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
         for k in rec.keys() {
             if !m.fields.iter().any(|f| &f.name == k) {
                 errs.push(Error(format!("{path}: unknown field `{k}` ({} fields: {})", m.name, m.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "))));
@@ -1160,7 +1160,7 @@ impl Engine {
         }
     }
 
-    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record, path: &str, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record, path: &DataPath<'_>, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
         let explicit = mode == RenderMode::Explicit;
         let mut out = Vec::new();
         macro_rules! fail {
@@ -1209,7 +1209,8 @@ impl Engine {
                         Some(v) => fail!("field `{}`: expected true/false, got {}", m.fields[*field].name, v.to_json()),
                     };
                     let unspellable = !v && (self.dialect.negation.is_none() || self.literal_no(lits));
-                    if v == *default && !(explicit && !unspellable) { continue; }
+                    // At the default: canonical writes nothing; explicit writes it if it can.
+                    if v == *default && (!explicit || unspellable) { continue; }
                     if unspellable {
                         fail!("field `{}`: false has no spelling in this dialect (there is no negation for `{}`)", m.fields[*field].name, lits.show(&m.fields));
                     }
@@ -1235,7 +1236,7 @@ impl Engine {
                     match rec.get(name) {
                         None | Some(Value::Null) if *required => fail!("field `{name}` is missing (a required {})", sub.name),
                         None | Some(Value::Null) => {}
-                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r, &format!("{path}.{name}"), mode, errs)),
+                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r, &DataPath::Field(path, name), mode, errs)),
                         Some(v) => fail!("field `{name}`: expected a record ({}), got {}", sub.name, v.to_json()),
                     }
                 }
@@ -1250,7 +1251,7 @@ impl Engine {
                     let key_fields: Vec<&str> = sub.fields.iter().filter(|f| f.kind == Kind::Key).map(|f| f.name.as_str()).collect();
                     let mut seen: IndexMap<Vec<Option<&Value>>, usize> = IndexMap::new();
                     for (i, it) in items.iter().enumerate() {
-                        let at = format!("{path}.{name}[{i}]");
+                        let at = DataPath::Index(path, name, i);
                         let Some(r) = it.as_record() else {
                             errs.push(Error(format!("{at}: expected a {} record, got {}", sub.name, it.to_json())));
                             continue;
@@ -1269,6 +1270,24 @@ impl Engine {
             }
         }
         out
+    }
+}
+
+/// Where a record is in the data (`Device.bgp[0].neighbors[1]`), formatted only for errors.
+#[derive(Clone, Copy)]
+pub(crate) enum DataPath<'a> {
+    Root(&'a str),
+    Field(&'a DataPath<'a>, &'a str),
+    Index(&'a DataPath<'a>, &'a str, usize),
+}
+
+impl std::fmt::Display for DataPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataPath::Root(m) => f.write_str(m),
+            DataPath::Field(p, n) => write!(f, "{p}.{n}"),
+            DataPath::Index(p, n, i) => write!(f, "{p}.{n}[{i}]"),
+        }
     }
 }
 

@@ -17,7 +17,7 @@
 //! a missing flag or defaulted field is its default, and a missing collection is empty.
 
 use crate::dialect::{quote, Dialect, Grammar};
-use crate::engine::{CShape, Card, Compiled, Engine, Mode, Pattern, RenderMode, Slot};
+use crate::engine::{CShape, Card, Compiled, DataPath, Engine, Mode, Pattern, RenderMode, Slot};
 use crate::lexer::OwnedNode;
 use crate::model::Kind;
 use indexmap::IndexMap;
@@ -194,7 +194,7 @@ impl Engine {
     fn diff_item(&self, m: &Compiled, r: Option<&Record>, i: Option<&Record>, opts: DiffOptions) -> Result<Vec<Change>> {
         let render = |rec: &Record| -> Result<Vec<OwnedNode>> {
             let mut errs = Vec::new();
-            let nodes = self.render_one(m, rec, &m.name, RenderMode::Canonical, &mut errs);
+            let nodes = self.render_one(m, rec, &DataPath::Root(&m.name), RenderMode::Canonical, &mut errs);
             match errs.into_iter().next() { Some(e) => Err(e), None => Ok(nodes) }
         };
         match (r, i) {
