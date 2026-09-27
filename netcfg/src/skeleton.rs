@@ -67,7 +67,7 @@ impl Engine {
             Kind::Scalar => "required".to_string(),
             Kind::Opt => "optional".to_string(),
             Kind::Flag => format!("flag, default {}", f.default.as_ref().map(|d| d[0].as_str()).unwrap_or("false")),
-            Kind::Many => format!("list of {}", f.type_spec),
+            Kind::Many => format!("{}list of {}", if f.ordered { "ordered " } else { "" }, f.type_spec),
             Kind::Single { required } => format!("{} {}", if required { "required" } else { "optional" }, f.type_spec),
         };
         match f.kind {

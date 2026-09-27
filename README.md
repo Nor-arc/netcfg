@@ -66,6 +66,7 @@ Templates use three placeholder markers, one per kind of field:
 | `f: T?` | The line is optional. |
 | `f: flag` / `f: flag = true` (written `[[ f ]]` in the template) | Presence of a literal line; `<negation> <line>` is `false`. Set the default to the device's default so negated lines render exactly when needed. A flag whose template literals start with the negation word (`no ip address {{ cleared }}`) is matched literally and only has that spelling. |
 | `f: [Model]` | A keyed collection; `<< f >>` alone on a line stands for all of its blocks/lines. |
+| `f: [Model] ordered` | A positional collection: elements are identified by position, not key. Every matching block/line is an element, in config order; rendering follows data order; duplicates are allowed. The element model may have no key (then its template must have exactly one top-level line, like an ACL entry `{{ action }} {{ match }}`). Flat groups can't be positional. |
 | `f: Model?` / `f: Model` | A singleton nested model (optional / required): at most one block or group of `Model` at this level, a second is a `duplicate` error. The data is a record, or the key is missing when absent. A model without keys can be a singleton if its template has exactly one top-level line (`snmp-server` with nested lines); that line is its identity. |
 | `type name = /regex/` | One-token type validated by a regex. |
 | `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
@@ -74,7 +75,7 @@ Templates use three placeholder markers, one per kind of field:
 | `type name = string \| ""` | An empty literal matches nothing at the end of the line: a value that may be present without a value (`neighbor X group` vs `neighbor X group CORE`, data `""` vs `"CORE"`). Must be the last placeholder. |
 | `type name = {{ limit: int }} {{ action: "warning-only" \| "" }}` | Struct type: a value's own little template. Data is a record (`{limit: 1200, action: warning-only}`); sub-fields whose type allows `""` may sit anywhere and are omitted when absent. Placeholders may use inline unions. |
 | `f: {{ limit: int }} {{ action: "warning-only" \| "" }}?` | Anonymous struct on a field, for one-off shapes; `type` is for reused ones. |
-| `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. |
+| `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. Inside a struct type, a list stops before a literal that can follow it: in `{{ names: list(string) }} {{ exact: "exact-match" \| "" }}`, `A B exact-match` is `names: [A, B], exact: exact-match`. A token that could be either an element or that literal is taken as the literal. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
 | `fragment Name` + `<< @Name >>` | A reusable run of body lines with its own fields and no identity (see below). |
 

@@ -18,6 +18,16 @@ pub trait Scalar: Send + Sync {
     }
     /// Read a value from the start of `toks`, returning it and how many tokens were used.
     fn parse(&self, toks: &[&str]) -> Result<(Value, usize), String>;
+    /// `parse`, but a type that would consume a variable number of tokens (a list) stops
+    /// before any token in `stop`: the literals that follow it inside a struct type.
+    fn parse_until(&self, toks: &[&str], stop: &[&str]) -> Result<(Value, usize), String> {
+        let _ = stop;
+        self.parse(toks)
+    }
+    /// The literal tokens this type can match (a union's quoted alternatives, not `""`).
+    fn literals(&self) -> Vec<&str> {
+        Vec::new()
+    }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String>;
     /// JSON Schema fragment for the value.
     fn schema(&self) -> serde_json::Value;
@@ -278,6 +288,9 @@ impl Scalar for UnionType {
     fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l, _) if l.is_empty())) }
     fn rest_of_line(&self) -> bool { self.allows_empty() }
     fn hint(&self) -> Option<String> { Some(self.describe_alts()) }
+    fn literals(&self) -> Vec<&str> {
+        self.alts.iter().filter_map(|a| match a { Alt::Lit(l, _) if !l.is_empty() => Some(l.as_str()), _ => None }).collect()
+    }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         for a in &self.alts {
             match a {
@@ -321,6 +334,23 @@ pub enum SToken {
 /// `type maxRoutes = {{ limit: int }} {{ action: "warning-only" | "" }}`.
 /// The value is a record; sub-fields whose type allows "nothing" are omitted when absent.
 pub struct StructType { pub name: String, pub toks: Vec<SToken> }
+impl StructType {
+    /// Literals that may come next from token `from` on: literal tokens, and the literals of
+    /// placeholders up to and including the first one that cannot match nothing.
+    fn stop_words(&self, from: usize) -> Vec<&str> {
+        let mut out = Vec::new();
+        for tok in &self.toks[from..] {
+            match tok {
+                SToken::Lit(l) => { out.push(l.as_str()); break; }
+                SToken::Field { ty, .. } => {
+                    out.extend(ty.literals());
+                    if !ty.allows_empty() { break; }
+                }
+            }
+        }
+        out
+    }
+}
 impl Scalar for StructType {
     fn name(&self) -> &str { &self.name }
     fn rest_of_line(&self) -> bool {
@@ -332,14 +362,15 @@ impl Scalar for StructType {
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         let mut rec = crate::value::Record::new();
         let mut pos = 0;
-        for tok in &self.toks {
+        for (i, tok) in self.toks.iter().enumerate() {
             match tok {
                 SToken::Lit(l) => {
                     if t.get(pos) == Some(&l.as_str()) { pos += 1; }
                     else { return Err(format!("{}: expected `{l}`, found {}", self.name, t.get(pos).map(|w| format!("'{w}'")).unwrap_or_else(|| "end of line".into()))); }
                 }
                 SToken::Field { name, ty } => {
-                    let (v, n) = ty.parse(&t[pos..]).map_err(|e| format!("{}.{name}: {e}", self.name))?;
+                    let stop = self.stop_words(i + 1);
+                    let (v, n) = ty.parse_until(&t[pos..], &stop).map_err(|e| format!("{}.{name}: {e}", self.name))?;
                     pos += n;
                     if !(n == 0 && v.as_str() == Some("")) { rec.insert(name.clone(), v); }
                 }
@@ -386,6 +417,13 @@ impl Scalar for ListType {
     fn elem(&self) -> Option<&ScalarRef> { Some(&self.elem) }
     fn rest_of_line(&self) -> bool { true }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
+        self.parse_until(t, &[])
+    }
+    /// Stops before a stop word; a token that is both an element and a stop word is taken as
+    /// the stop word.
+    fn parse_until(&self, t: &[&str], stop: &[&str]) -> Result<(Value, usize), String> {
+        let end = t.iter().position(|w| stop.contains(w)).unwrap_or(t.len());
+        let t = &t[..end];
         if t.is_empty() { return Err(format!("expected one or more {}", self.elem.name())); }
         let mut out = Vec::new();
         let mut pos = 0;

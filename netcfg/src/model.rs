@@ -58,6 +58,8 @@ pub struct FieldDef {
     pub default: Option<Vec<String>>,
     /// Trailing `# ...` on the declaration line.
     pub doc: Option<String>,
+    /// `[Model] ordered`: a positional collection (identity is position, not key).
+    pub ordered: bool,
     pub line: usize,
 }
 
@@ -386,6 +388,10 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
         None => (spec.trim(), None),
     } };
     if let Some(d) = &default { if d.is_empty() { return Err(Error(format!("field `{name}`: empty default"))); } }
+    let (spec, ordered) = match spec.strip_suffix(" ordered") {
+        Some(s) if s.trim_end().ends_with(']') => (s.trim_end(), true),
+        _ => (spec, false),
+    };
     let (key, spec) = match spec.strip_prefix("key ") {
         Some(s) => (true, s.trim()),
         None => (false, spec),
@@ -415,7 +421,7 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
         return Err(Error(format!("field `{name}`: only required values and flags can have a default")));
     }
     if type_spec.is_empty() { return Err(Error(format!("field `{name}`: missing type"))); }
-    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, doc, line: ln })
+    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, doc, ordered, line: ln })
 }
 
 #[cfg(test)]
@@ -432,6 +438,10 @@ mod tests {
         assert_eq!(m.fields[3].kind, Kind::Opt);
         assert_eq!(m.fields[4].default, Some(vec!["true".into()]));
         assert_eq!(m.fields[5].type_spec, "Kid");
+        assert!(!m.fields[5].ordered);
+        let g = parse("t.nct", "model Acl\n  name: key string\n  entries: [AclEntry] ordered   # in config order\n").unwrap();
+        let e = &g.models[0].fields[1];
+        assert_eq!((e.kind, e.type_spec.as_str(), e.ordered, e.doc.as_deref()), (Kind::Many, "AclEntry", true, Some("in config order")));
         let t = &f.templates[0];
         assert_eq!(t.model, "Rm");
         assert!(t.text.starts_with("route-map"));

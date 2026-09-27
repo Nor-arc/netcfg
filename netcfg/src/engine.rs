@@ -118,7 +118,10 @@ enum Slot {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Card {
+    /// `[Model]`: keyed; a repeated key is an error.
     Many,
+    /// `[Model] ordered`: positional; every match in order, duplicates allowed.
+    Ordered,
     Single { required: bool },
 }
 
@@ -299,8 +302,8 @@ impl Engine {
                     Kind::Many => {
                         match is_keyed(&f.type_spec) {
                             None => errs.push(format!("field `{}`: unknown model `{}`", f.name, f.type_spec)),
-                            Some(false) => errs.push(format!("field `{}`: model `{}` needs at least one key field to be used in a collection", f.name, f.type_spec)),
-                            Some(true) => {}
+                            Some(false) if !f.ordered => errs.push(format!("field `{}`: model `{}` needs at least one key field to be used in a collection (or make the collection positional: `[{}] ordered`)", f.name, f.type_spec, f.type_spec)),
+                            _ => {}
                         }
                         field_types.push(None);
                     }
@@ -331,14 +334,23 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        // An unkeyed model used as a singleton is identified by its one top-level line.
+        // An unkeyed model nested as a singleton or positional element is identified by its
+        // one top-level line; a flat group is identified by its key, so it has no position.
         for (d, m) in defs.iter().zip(models.values()) {
-            for (fi, f) in m.fields.iter().enumerate() {
-                if !matches!(f.kind, Kind::Single { .. }) { continue; }
-                if let CShape::Root { body } = &models[f.type_spec.as_str()].shape {
-                    if body.len() != 1 || matches!(body[0], Slot::Nested { .. }) {
-                        errors.push(format!("{}:{} model {}: field `{}`: {} has no key, so as a singleton it is identified by its header line; its template must have exactly one top-level line (not a << >> line), found {}", d.source, d.line, d.name, m.fields[fi].name, f.type_spec, body.len()));
+            for f in &m.fields {
+                let what = match f.kind {
+                    Kind::Single { .. } => "a singleton",
+                    Kind::Many if f.ordered => "a positional element",
+                    _ => continue,
+                };
+                match &models[f.type_spec.as_str()].shape {
+                    CShape::Root { body } if body.len() != 1 || matches!(body[0], Slot::Nested { .. }) => {
+                        errors.push(format!("{}:{} model {}: field `{}`: {} has no key, so as {what} it is identified by its header line; its template must have exactly one top-level line (not a << >> line), found {}", d.source, d.line, d.name, f.name, f.type_spec, body.len()));
                     }
+                    CShape::Flat { .. } if f.ordered => {
+                        errors.push(format!("{}:{} model {}: field `{}`: {} is a flat group, identified by its key; it cannot be a positional collection (drop `ordered`)", d.source, d.line, d.name, f.name, f.type_spec));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -544,7 +556,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         let toks = &l.toks[key_prefix_len..];
         let values: Vec<&FieldDef> = l.holes().into_iter().map(|h| &fields[fidx(h)]).filter(|f| f.kind != Kind::Key).collect();
         match values.as_slice() {
-            [f] if f.kind == Kind::Many => Ok(Slot::Nested { field: fidx(&f.name), model: index[f.type_spec.as_str()], card: Card::Many }),
+            [f] if f.kind == Kind::Many => Ok(Slot::Nested { field: fidx(&f.name), model: index[f.type_spec.as_str()], card: if f.ordered { Card::Ordered } else { Card::Many } }),
             [f] if matches!(f.kind, Kind::Single { .. }) => Ok(Slot::Nested { field: fidx(&f.name), model: index[f.type_spec.as_str()], card: Card::Single { required: f.kind == Kind::Single { required: true } } }),
             [f] if f.kind == Kind::Flag => Ok(Slot::Flag {
                 lits: pattern(toks),
@@ -589,6 +601,8 @@ enum SlotState {
     Block { items: Vec<Record>, keys: HashSet<Vec<Value>> },
     /// An unkeyed model used as a singleton: its body's states, and whether its line was seen.
     Inline { states: Vec<SlotState>, hit: bool },
+    /// An unkeyed model in a positional collection: one record per matching line/block.
+    Seq(Vec<Record>),
     Flat { groups: IndexMap<Vec<Value>, (Vec<(usize, Value)>, Vec<SlotState>)> },
 }
 
@@ -599,6 +613,7 @@ fn init_states(engine: &Engine, slots: &[Slot]) -> Vec<SlotState> {
         Slot::Nested { model, .. } => match &engine.models[*model].shape {
             CShape::Flat { .. } => SlotState::Flat { groups: IndexMap::new() },
             CShape::Block { .. } => SlotState::Block { items: Vec::new(), keys: HashSet::new() },
+            CShape::Root { .. } if matches!(s, Slot::Nested { card: Card::Ordered, .. }) => SlotState::Seq(Vec::new()),
             CShape::Root { body } => SlotState::Inline { states: init_states(engine, body), hit: false },
         },
         Slot::Container { .. } => SlotState::Container(None),
@@ -745,10 +760,22 @@ impl Engine {
                         _ => Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name)),
                     };
                 }
-                debug_assert!(*card != Card::Many);
+                debug_assert!(matches!(card, Card::Single { .. }));
                 let c = self.claim(&body[0], &mut states[0], n, unmanaged);
                 if matches!(c, Claim::Claimed) { *hit = true; }
                 c
+            }
+            (Slot::Nested { model, .. }, SlotState::Seq(items)) => {
+                let m = &self.models[*model];
+                let CShape::Root { body } = &m.shape else { unreachable!() };
+                let mut states = init_states(self, body);
+                match self.claim(&body[0], &mut states[0], n, unmanaged) {
+                    Claim::Claimed => match self.finish(m, body, states) {
+                        Ok(r) => { items.push(r); Claim::Claimed }
+                        Err(e) => Claim::Failed(format!("in `{}`: {}", n.line_text(), e.0)),
+                    },
+                    other => other,
+                }
             }
             (Slot::Nested { model, card, .. }, SlotState::Block { items, keys }) => {
                 let m = &self.models[*model];
@@ -756,8 +783,8 @@ impl Engine {
                 match header.parse_full(&n.tokens) {
                     PRes::Ok(vals, _) => {
                         let key: Vec<Value> = key_fields.iter().map(|f| vals.iter().find(|(i, _)| i == f).unwrap().1.clone()).collect();
-                        if *card != Card::Many && !items.is_empty() { return Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name)); }
-                        if !keys.insert(key) { return Claim::Failed(format!("duplicate {}: `{}`", m.name, n.line_text())); }
+                        if matches!(card, Card::Single { .. }) && !items.is_empty() { return Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name)); }
+                        if *card != Card::Ordered && !keys.insert(key) { return Claim::Failed(format!("duplicate {}: `{}`", m.name, n.line_text())); }
                         let mut inner = Vec::new();
                         let states = match self.parse_body(body, &m.ignores, &n.children, &mut inner) {
                             Ok(s) => s,
@@ -814,7 +841,7 @@ impl Engine {
                 }
                 let Some((i, vals)) = hit else { return Claim::NotMine };
                 let key: Vec<Value> = kvals.iter().map(|(_, v)| v.clone()).collect();
-                if *card != Card::Many && !groups.is_empty() && !groups.contains_key(&key) {
+                if matches!(card, Card::Single { .. }) && !groups.is_empty() && !groups.contains_key(&key) {
                     return Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name));
                 }
                 let entry = groups.entry(key).or_insert_with(|| (kvals.clone(), init_states(self, lines)));
@@ -887,7 +914,7 @@ impl Engine {
                     let b = match st { Some(SlotState::Flag(Some(b))) => b, _ => *default };
                     vals[*field] = Some(Value::Bool(b));
                 }
-                (Slot::Nested { field, model, card: Card::Many }, st) => {
+                (Slot::Nested { field, model, card: Card::Many | Card::Ordered }, st) => {
                     let items = match st { Some(st) => self.finish_many(&self.models[*model], st)?, None => Vec::new() };
                     vals[*field] = Some(Value::List(items.into_iter().map(Value::Record).collect()));
                 }
@@ -924,7 +951,7 @@ impl Engine {
 
     fn finish_many(&self, m: &Compiled, state: SlotState) -> Result<Vec<Record>> {
         match state {
-            SlotState::Block { items, .. } => Ok(items),
+            SlotState::Block { items, .. } | SlotState::Seq(items) => Ok(items),
             SlotState::Flat { groups } => {
                 let CShape::Flat { lines, .. } = &m.shape else { unreachable!() };
                 let mut out = Vec::new();
@@ -1065,7 +1092,7 @@ impl Engine {
                         Some(v) => fail!("field `{name}`: expected a record ({}), got {}", sub.name, v.to_json()),
                     }
                 }
-                Slot::Nested { field, model, card: Card::Many } => {
+                Slot::Nested { field, model, card: card @ (Card::Many | Card::Ordered) } => {
                     let name = &m.fields[*field].name;
                     let items = match rec.get(name) {
                         None | Some(Value::Null) => continue,
@@ -1082,7 +1109,7 @@ impl Engine {
                             continue;
                         };
                         let key: Vec<Option<&Value>> = key_fields.iter().map(|k| r.get(*k)).collect();
-                        if !key_fields.is_empty() && key.iter().all(Option::is_some) {
+                        if *card == Card::Many && !key_fields.is_empty() && key.iter().all(Option::is_some) {
                             if let Some(j) = seen.get(&key) {
                                 errs.push(Error(format!("{at}: duplicate {} (same {} as {name}[{j}])", sub.name, key_fields.join(", "))));
                                 continue;
@@ -1169,6 +1196,11 @@ impl Engine {
                         out.push_str(&format!("{} (list of {})\n", m.fields[*field].name, e.models[*model].name));
                         doc_line(&m.fields[*field], out);
                         out.push_str(&format!("  each     → {prefix}one {} block/group\n", e.models[*model].name));
+                    }
+                    Slot::Nested { field, model, card: Card::Ordered } => {
+                        out.push_str(&format!("{} (ordered list of {})\n", m.fields[*field].name, e.models[*model].name));
+                        doc_line(&m.fields[*field], out);
+                        out.push_str(&format!("  each     → {prefix}one {} block/line, in data order (identity is position; duplicates allowed)\n", e.models[*model].name));
                     }
                     Slot::Nested { field, model, card: Card::Single { required } } => {
                         let sub = &e.models[*model];
