@@ -123,6 +123,15 @@ pub struct TemplateDef {
     pub line: usize,
 }
 
+/// A `set NAME` section: a set manifest's properties as written, resolved by
+/// `Engine::load_set`.
+#[derive(Debug, Clone)]
+pub struct SetDef {
+    pub name: String,
+    pub props: Vec<(String, String, usize)>,
+    pub line: usize,
+}
+
 /// A `dialect NAME` section: properties as written, resolved by `Dialect::from_props`.
 #[derive(Debug, Clone)]
 pub struct DialectDef {
@@ -137,6 +146,8 @@ pub struct File {
     pub models: Vec<ModelDef>,
     pub templates: Vec<TemplateDef>,
     pub dialect: Option<DialectDef>,
+    /// A set manifest (`set NAME`), if the file is one.
+    pub set: Option<SetDef>,
     /// Deprecations and other non-fatal notes, each naming file and line.
     pub warnings: Vec<String>,
 }
@@ -163,6 +174,7 @@ fn template_text(lines: &[(usize, &str)]) -> String {
 enum Section<'a> {
     None,
     Dialect(DialectDef),
+    Set(SetDef),
     Model(ModelDef),
     Template(TemplateDef, Vec<(usize, &'a str)>),
 }
@@ -184,6 +196,10 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
             Section::Dialect(d) => {
                 if file.dialect.is_some() { errors.push(format!("{source}:{}: only one `dialect` section per file", d.line)); }
                 file.dialect = Some(d);
+            }
+            Section::Set(d) => {
+                if file.set.is_some() { errors.push(format!("{source}:{}: only one `set` section per file", d.line)); }
+                file.set = Some(d);
             }
             Section::Model(m) => file.models.push(m),
             Section::Template(mut t, lines) => {
@@ -222,6 +238,10 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
                     Some((k, v)) => d.props.push((k.trim().to_string(), v.trim().to_string(), ln)),
                     None => err(&mut errors, ln, "expected `key: value` in the dialect section".into()),
                 },
+                Section::Set(d) => match split_doc(t).0.split_once(':') {
+                    Some((k, v)) => d.props.push((k.trim().to_string(), v.trim().to_string(), ln)),
+                    None => err(&mut errors, ln, "expected `key: value` in the set section".into()),
+                },
                 Section::Model(m) => match parse_field(t, ln) {
                     Ok(f) => {
                         if m.fields.iter().any(|g| g.name == f.name) { err(&mut errors, ln, format!("duplicate field `{}`", f.name)); }
@@ -245,6 +265,10 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
             "dialect" => {
                 if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid dialect name")); }
                 section = Section::Dialect(DialectDef { name: rest.to_string(), props: Vec::new(), line: ln });
+            }
+            "set" => {
+                if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid set name")); }
+                section = Section::Set(SetDef { name: rest.to_string(), props: Vec::new(), line: ln });
             }
             "model" | "fragment" => {
                 if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid {kw} name")); }
@@ -272,7 +296,7 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
                 };
                 section = Section::Template(TemplateDef { model: name, text: String::new(), first_line: ln + 1, source: source.to_string(), line: ln }, Vec::new());
             }
-            other => err(&mut errors, ln, format!("unexpected `{other}`; expected `dialect`, `type`, `model`, `fragment` or `template`")),
+            other => err(&mut errors, ln, format!("unexpected `{other}`; expected `set`, `dialect`, `type`, `model`, `fragment` or `template`")),
         }
     }
     close(&mut section, &mut file, &mut errors, source);

@@ -1,0 +1,6 @@
+# The EOS example set.
+set eos
+  dialect: eos
+  version: 2026.09.1
+  include: ../common/routemap.nct
+  root: EosDevice

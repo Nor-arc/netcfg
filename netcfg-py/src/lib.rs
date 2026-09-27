@@ -1,7 +1,8 @@
 //! Python bindings: `import netcfg`.
 //!
 //! ```python
-//! e = netcfg.Engine("templates/nxos")   # dialect from the templates' declaration
+//! e = netcfg.Engine("templates/nxos")   # a set: manifest, or directory; dialect from the templates
+//! sets = netcfg.load_all("templates")    # {"nxos": Engine, ...} for every manifest below
 //! result = e.parse("Device", text)       # result.value is a dict, result.unmanaged a list of paths
 //! text = e.render("Device", result.value)
 //! schema = e.schema("Device")
@@ -66,6 +67,12 @@ struct Parsed {
     /// Unmanaged lines as paths, e.g. `router bgp 65000 > neighbor 10.0.0.1 > bfd`.
     #[pyo3(get)]
     unmanaged: Vec<String>,
+    /// The netcfg version that parsed the config.
+    #[pyo3(get)]
+    engine_version: String,
+    /// The template set's `version`, or "unversioned" for directory loads.
+    #[pyo3(get)]
+    templates_version: String,
 }
 
 fn warn(py: Python<'_>, core: &Core) -> PyResult<()> {
@@ -82,13 +89,14 @@ struct Engine {
 
 #[pymethods]
 impl Engine {
-    /// Load every `.nct` file under `templates`. `dialect` names a builtin (ios, nxos, eos,
-    /// junos) used only when the templates don't declare their own. Deprecated forms in the
+    /// Load a template set: a set manifest (`set.nct`), or a directory (its manifest if it has
+    /// one, else every `.nct` file under it). `dialect` names a builtin (ios, nxos, eos, junos)
+    /// used only when the templates don't declare their own. Deprecated forms in the
     /// templates are reported as `DeprecationWarning`s.
     #[new]
     #[pyo3(signature = (templates, dialect = None))]
     fn new(py: Python<'_>, templates: &str, dialect: Option<&str>) -> PyResult<Self> {
-        let core = Core::load_dir(std::path::Path::new(templates), dialect).map_err(|e| PyValueError::new_err(e.0))?;
+        let core = Core::load_path(std::path::Path::new(templates), dialect).map_err(|e| PyValueError::new_err(e.0))?;
         warn(py, &core)?;
         Ok(Engine { core })
     }
@@ -118,10 +126,22 @@ impl Engine {
         self.core.dialect.name.clone()
     }
 
+    /// The set's name from its manifest, or None for directory loads.
+    #[getter]
+    fn set_name(&self) -> Option<String> {
+        self.core.set.as_ref().map(|m| m.name.clone())
+    }
+
+    /// The set's `version`, or "unversioned".
+    #[getter]
+    fn templates_version(&self) -> String {
+        self.core.templates_version().to_string()
+    }
+
     /// Parse config text into model data. Raises ValueError on unrepresentable config.
     fn parse(&self, py: Python<'_>, model: &str, text: &str) -> PyResult<Parsed> {
         let parsed = py.allow_threads(|| self.core.parse(model, text)).map_err(|e| PyValueError::new_err(e.0))?;
-        Ok(Parsed { value: to_py(py, &parsed.value)?, unmanaged: parsed.unmanaged_paths() })
+        Ok(Parsed { value: to_py(py, &parsed.value)?, unmanaged: parsed.unmanaged_paths(), engine_version: parsed.engine_version, templates_version: parsed.templates_version })
     }
 
     /// Render model data (dict) to config text.
@@ -154,9 +174,22 @@ impl Engine {
     }
 }
 
+/// Every template set under `dir` (each set manifest found recursively), by set name.
+#[pyfunction]
+fn load_all(py: Python<'_>, dir: &str) -> PyResult<std::collections::BTreeMap<String, Engine>> {
+    let sets = Core::load_all(std::path::Path::new(dir)).map_err(|e| PyValueError::new_err(e.0))?;
+    let mut out = std::collections::BTreeMap::new();
+    for (name, core) in sets {
+        warn(py, &core)?;
+        out.insert(name, Engine { core });
+    }
+    Ok(out)
+}
+
 #[pymodule]
 fn netcfg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
+    m.add_function(wrap_pyfunction!(load_all, m)?)?;
     m.add_class::<Parsed>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__build__", concat!(env!("CARGO_PKG_VERSION"), "+", env!("NETCFG_BUILD")))?;

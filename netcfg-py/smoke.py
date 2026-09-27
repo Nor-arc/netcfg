@@ -56,4 +56,12 @@ errs = e.validate_data("Device", {"hostname": "h", "bgp": [{"asn": 1, "neighbors
 assert len(errs) == 2 and "Device.bgp[0].neighbors[0]: field `remoteAs`" in errs[0], errs
 assert e.validate_data("Device", r.value) == []
 
+# Sets and provenance.
+assert e.set_name == "nxos" and e.templates_version == "2026.09.1"
+assert r.templates_version == "2026.09.1" and r.engine_version == netcfg.__version__
+sets = netcfg.load_all(str(T))
+assert sorted(sets) == ["eos", "ios", "junos", "nxos"], sets
+assert netcfg.Engine(str(T / "eos" / "set.nct")).set_name == "eos"
+assert s.set_name is None and s.parse("D", "").templates_version == "unversioned"
+
 print("ok")

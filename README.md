@@ -44,7 +44,8 @@ Files used the `.ttp` extension until 0.4; that collides with TTP, so the extens
 
 ## The `.nct` format
 
-A set is a directory of `.nct` files. Each holds `dialect`, `type`, `model` (and
+A set is described by a manifest (see [Template sets](#template-sets)), or is simply a
+directory of `.nct` files. Each file holds `dialect`, `type`, `model` (and
 `fragment`) declarations and `template NAME` sections. A template names the model it
 belongs to and may sit anywhere in the set; `netcfg fmt` places each one directly after
 its model. (A bare `template` still pairs with the model above it, with a deprecation
@@ -131,6 +132,37 @@ between `Neighbor` and `PeerTemplate`.
 
 Template shapes are inferred: one header line with nested lines is a **block**; several sibling lines that all carry the key are a **flat group** (EOS/IOS `neighbor X …` lines); a model without keys is a **root** document.
 
+## Template sets
+
+A set manifest is a `.nct` file with a `set` section:
+
+```text
+set nxos
+  dialect: nxos
+  version: 2026.09.1
+  include: ../common/routemap.nct
+  files: *.nct            # the default
+  root: Device            # the device model (used by `netcfg check`)
+```
+
+Paths are relative to the manifest. `files` and `include` take comma-separated globs (`*`,
+`?`, `**`); `include` may repeat and each pattern must match a file. Included files may
+define types and models; a model defined twice is an error. The manifest itself and
+`*.test.nct` files are never template files. `dialect` names a builtin, or the dialect the
+set's files declare (the two must agree).
+
+`version` is recorded on the engine and stamped into every parse result
+(`Parsed.templates_version`, `"unversioned"` for directory loads) next to
+`engine_version`. `Engine::load_set(manifest)` loads one set; `Engine::load_all(dir)` loads
+every manifest found under `dir`, by set name. A directory that contains a manifest loads as
+that set, so `templates/nxos` and `templates/nxos/set.nct` are the same thing; a directory
+without one still loads every `.nct` file under it. The example sets under `templates/`
+each have a manifest, and NX-OS and EOS share `templates/common/routemap.nct` through
+`include`.
+
+Versioned template variants (`template NAME @nxos>=10.2`) are designed but not implemented:
+see [docs/template-variants.md](docs/template-variants.md).
+
 ## Dialects
 
 A dialect is declared, not coded, in a `dialect` section (conventionally `dialect.nct` next to the templates):
@@ -190,8 +222,14 @@ Every line under a block the model owns ends up in exactly one place: **claimed*
 
 ## CLI
 
+Every command takes the set either as `--set path/to/set.nct` or as a leading TEMPLATES
+argument (a manifest, or a directory):
+
 ```
 cargo build --release
+netcfg validate templates                           # every set under templates/
+netcfg validate --set templates/nxos/set.nct
+netcfg parse --set templates/nxos/set.nct running.cfg --model Device
 netcfg validate templates/nxos
 netcfg parse   templates/nxos running.cfg --model Device --format yaml --unmanaged
 netcfg render  templates/nxos intent.yaml  --model Device
@@ -215,8 +253,11 @@ Bindings use pyo3 0.22, which supports CPython 3.7–3.13. For Python 3.14 bump 
 `netcfg-py/Cargo.toml` to 0.25 or later (the Bound API used here is unchanged).
 ```python
 import netcfg
-e = netcfg.Engine("templates/nxos")            # dialect comes from the templates' declaration
+e = netcfg.Engine("templates/nxos")            # a manifest or a directory; dialect from the templates
+sets = netcfg.load_all("templates")             # {"eos": Engine, "ios": ..., ...}
+e.set_name, e.templates_version                 # "nxos", "2026.09.1"
 r = e.parse("Device", text)      # r.value: dict, r.unmanaged: list of paths; ValueError on bad config
+r.engine_version, r.templates_version
 text = e.render("Device", r.value)
 schema = e.schema("Device")
 print(e.skeleton("Device"))      # example YAML
@@ -251,9 +292,12 @@ netcfg/src/template.rs   template text parser, shape inference, validation (pure
 netcfg/src/engine.rs     compile to patterns/slots; strict node-major parse; render
 netcfg/src/schema.rs     JSON Schema from model declarations
 netcfg/src/skeleton.rs   example YAML for a model
+netcfg/src/set.rs        set manifests: files, includes, version, load_set / load_all
 netcfg/src/main.rs       CLI
 netcfg-py/               PyO3 bindings (maturin)
-templates/{ios,nxos,eos,junos} example dialects and models
+templates/{ios,nxos,eos,junos} example sets (each with a set.nct manifest)
+templates/common/        files shared between sets through `include`
+docs/                    design notes
 ```
 
 ## Next

@@ -11,13 +11,14 @@ pub mod fmt;
 pub mod lexer;
 pub mod model;
 pub mod schema;
+pub mod set;
 pub mod skeleton;
 pub mod template;
 pub mod types;
 pub mod value;
 
 pub use dialect::Dialect;
-pub use engine::{Engine, Parsed};
+pub use engine::{Engine, Parsed, ENGINE_VERSION};
 pub use lexer::Node;
 pub use value::{Record, Value};
 

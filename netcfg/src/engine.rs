@@ -154,6 +154,10 @@ pub struct Engine {
     models: IndexMap<String, Compiled>,
     /// Non-fatal notes from loading (deprecations), each naming file and line.
     pub warnings: Vec<String>,
+    /// The manifest's `version`, if the engine was loaded from a versioned set.
+    pub templates_version: Option<String>,
+    /// The manifest, if the engine was loaded from one.
+    pub set: Option<crate::set::Manifest>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -166,7 +170,14 @@ impl std::fmt::Debug for Engine {
 pub struct Parsed {
     pub value: Value,
     pub unmanaged: Vec<OwnedNode>,
+    /// The netcfg version that produced this (`CARGO_PKG_VERSION`).
+    pub engine_version: String,
+    /// The template set's version, or `unversioned` (directory loads).
+    pub templates_version: String,
 }
+
+/// The netcfg library version.
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl Parsed {
     pub fn unmanaged_paths(&self) -> Vec<String> { OwnedNode::leaf_paths(&self.unmanaged) }
@@ -355,13 +366,20 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        Ok(Engine { dialect, catalog, models, warnings })
+        Ok(Engine { dialect, catalog, models, warnings, templates_version: None, set: None })
+    }
+
+    /// Load a directory as a set. If it holds a set manifest, that manifest defines the set
+    /// (`Engine::load_set`); otherwise every template file under it is loaded (see
+    /// `load_dir_files`). `fallback` names a builtin dialect used when none is declared.
+    pub fn load_dir(dir: &std::path::Path, fallback: Option<&str>) -> Result<Engine> {
+        Engine::load_path(dir, fallback)
     }
 
     /// Load every `*.nct` file under `dir` (recursively), except `*.test.nct` test files.
     /// `*.ttp` files are still accepted, with a deprecation warning. `fallback` names a
     /// builtin dialect used when the files declare none.
-    pub fn load_dir(dir: &std::path::Path, fallback: Option<&str>) -> Result<Engine> {
+    pub fn load_dir_files(dir: &std::path::Path, fallback: Option<&str>) -> Result<Engine> {
         let mut paths = Vec::new();
         fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
             for e in std::fs::read_dir(p)? {
@@ -377,6 +395,11 @@ impl Engine {
 
     /// Load the given template files as one set.
     pub fn load_files(paths: &[std::path::PathBuf], fallback: Option<&str>) -> Result<Engine> {
+        Engine::build(&Engine::read_files(paths)?, fallback)
+    }
+
+    /// Read and parse template files, reporting every file's errors.
+    pub fn read_files(paths: &[std::path::PathBuf]) -> Result<Vec<model::File>> {
         let mut files = Vec::new();
         let mut errors = Vec::new();
         for p in paths {
@@ -392,7 +415,7 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        Engine::build(&files, fallback)
+        Ok(files)
     }
 
     pub fn from_text(source: &str, text: &str, fallback: Option<&str>) -> Result<Engine> {
@@ -400,6 +423,8 @@ impl Engine {
     }
 
     pub fn model(&self, name: &str) -> Option<&Compiled> { self.models.get(name) }
+    /// The set's version, or `unversioned`.
+    pub fn templates_version(&self) -> &str { self.templates_version.as_deref().unwrap_or("unversioned") }
     pub fn model_names(&self) -> Vec<&str> { self.models.keys().map(String::as_str).collect() }
 
     fn model_idx(&self, name: &str) -> Result<usize> {
@@ -666,7 +691,7 @@ impl Engine {
                 Value::Record(items.pop().unwrap())
             }
         };
-        Ok(Parsed { value, unmanaged })
+        Ok(Parsed { value, unmanaged, engine_version: ENGINE_VERSION.to_string(), templates_version: self.templates_version().to_string() })
     }
 
     fn parse_body(&self, slots: &[Slot], ignores: &[Vec<String>], nodes: &[Node<'_>], unmanaged: &mut Vec<OwnedNode>) -> Result<Vec<SlotState>> {

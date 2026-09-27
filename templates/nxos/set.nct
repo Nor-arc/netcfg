@@ -1,0 +1,6 @@
+# The NX-OS example set.
+set nxos
+  dialect: nxos
+  version: 2026.09.1
+  include: ../common/routemap.nct
+  root: Device
