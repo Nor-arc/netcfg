@@ -15,6 +15,8 @@ pub enum Tok {
     Flag(String),
     /// `<< field >>`: whole statements/blocks of a nested model at this level.
     Nest(String),
+    /// `<< @Fragment >>`: the fragment's lines, spliced in at load.
+    Include(String),
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,8 @@ pub struct TLine {
     pub line: usize,
     pub children: Vec<TLine>,
     pub ignore: bool,
+    /// The fragment this line was spliced from, if any (for error messages).
+    pub origin: Option<String>,
 }
 
 impl TLine {
@@ -35,7 +39,18 @@ impl TLine {
         self.toks.iter().filter_map(|t| match t { Tok::Lit(s) => Some(s.clone()), _ => None }).collect()
     }
     pub fn text(&self) -> String {
-        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]"), Tok::Nest(n) => format!("<< {n} >>") }).collect::<Vec<_>>().join(" ")
+        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]"), Tok::Nest(n) => format!("<< {n} >>"), Tok::Include(n) => format!("<< @{n} >>") }).collect::<Vec<_>>().join(" ")
+    }
+    /// Where the line is, for messages: `template line 12`, or `fragment Common line 3`.
+    pub fn at(&self) -> String {
+        match &self.origin {
+            Some(f) => format!("fragment {f} line {}", self.line),
+            None => format!("template line {}", self.line),
+        }
+    }
+    /// The fragment named by a `<< @Name >>` line.
+    pub fn include(&self) -> Option<&str> {
+        match self.toks.as_slice() { [Tok::Include(n)] => Some(n), _ => None }
     }
 }
 
@@ -58,7 +73,7 @@ pub fn from_nodes(nodes: &[crate::lexer::Node<'_>], first_line: usize) -> Result
         if n.tokens.first() == Some(&"@ignore") {
             if n.tokens.len() == 1 { errors.push(format!("template line {line}: `@ignore` needs at least one word")); }
             if !n.children.is_empty() { errors.push(format!("template line {line}: `@ignore` lines cannot have children")); }
-            return TLine { toks: n.tokens[1..].iter().map(|s| Tok::Lit(s.to_string())).collect(), line, children: Vec::new(), ignore: true };
+            return TLine { toks: n.tokens[1..].iter().map(|s| Tok::Lit(s.to_string())).collect(), line, children: Vec::new(), ignore: true, origin: None };
         }
         let toks = n.tokens.iter().map(|w| {
             if let Some(inner) = w.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
@@ -66,14 +81,20 @@ pub fn from_nodes(nodes: &[crate::lexer::Node<'_>], first_line: usize) -> Result
             } else if let Some(inner) = w.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
                 Tok::Flag(inner.trim().to_string())
             } else if let Some(inner) = w.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
-                Tok::Nest(inner.trim().to_string())
+                match inner.trim().strip_prefix('@') {
+                    Some(frag) => {
+                        if n.tokens.len() != 1 || !n.children.is_empty() { errors.push(format!("template line {line}: << @{frag} >> must be alone on its line")); }
+                        Tok::Include(frag.trim().to_string())
+                    }
+                    None => Tok::Nest(inner.trim().to_string()),
+                }
             } else {
                 if ["{{", "}}", "[[", "]]", "<<", ">>"].iter().any(|m| w.contains(m)) { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value), [[ name ]] (flag) or << name >> (nested model)")); }
                 Tok::Lit(w.to_string())
             }
         }).collect();
         let children = n.children.iter().map(|c| conv(c, first_line, errors)).collect();
-        TLine { toks, line, children, ignore: false }
+        TLine { toks, line, children, ignore: false, origin: None }
     }
     let lines: Vec<TLine> = nodes.iter().map(|n| conv(n, first_line, &mut errors)).collect();
     if errors.is_empty() { Ok(lines) } else { Err(errors) }
@@ -142,7 +163,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     fn all<'a>(ls: &'a [TLine], out: &mut Vec<&'a TLine>) { for l in ls { out.push(l); all(&l.children, out); } }
     let mut every: Vec<&TLine> = Vec::new();
     all(lines, &mut every);
-    let err = |errs: &mut Vec<String>, l: &TLine, msg: String| errs.push(format!("template line {} `{}`: {msg}", l.line, l.text()));
+    let err = |errs: &mut Vec<String>, l: &TLine, msg: String| errs.push(format!("{} `{}`: {msg}", l.at(), l.text()));
 
     for l in &every {
         for h in l.holes() {
@@ -192,7 +213,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     fn check_body_line(errs: &mut Vec<String>, l: &TLine, allow_keys: bool, allow_containers: bool, check_value_line: &dyn Fn(&mut Vec<String>, &TLine, bool)) {
         if !l.children.is_empty() && l.holes().is_empty() {
             if !allow_containers {
-                errs.push(format!("template line {} `{}`: a flat group line cannot have nested lines", l.line, l.text()));
+                errs.push(format!("{} `{}`: a flat group line cannot have nested lines", l.at(), l.text()));
                 return;
             }
             for c in l.children.iter().filter(|c| !c.ignore) { check_body_line(errs, c, allow_keys, true, check_value_line); }
@@ -225,7 +246,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
                     Some(k) if !k.is_nested() => err(errs, l, format!("`{n}` is a value, not a nested model: << >> is for [Model] and Model? fields; a value is written {{{{ {n} }}}}")),
                     _ => if l.toks.len() != 1 { err(errs, l, format!("<< {n} >> must be alone on its line")); },
                 },
-                Tok::Lit(_) => {}
+                Tok::Lit(_) | Tok::Include(_) => {}
             }
         }
         if let Some(m) = metas.iter().find(|m| m.kind == Kind::Flag) {

@@ -32,6 +32,10 @@ enum Cmd {
     Render { templates: PathBuf, data: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Show how every field of a model is spelled in config (values, defaults, negations).
     Explain { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
+    /// Print example YAML data for a model: every field, typed placeholders, comments.
+    Skeleton { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
+    /// Check a data file (JSON/YAML) against a model without rendering; prints every error.
+    ValidateData { templates: PathBuf, data: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Print the JSON Schema for a model's data.
     Schema { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Rewrite .nct files to the current form: named templates, each placed after its model.
@@ -110,6 +114,21 @@ fn run(cli: Cli) -> Result<(), String> {
             let e = load(&templates, &d)?;
             print!("{}", e.explain(&model).map_err(|e| e.0)?);
             Ok(())
+        }
+        Cmd::Skeleton { templates, model, dialect: d } => {
+            let e = load(&templates, &d)?;
+            print!("{}", e.skeleton(&model).map_err(|e| e.0)?);
+            Ok(())
+        }
+        Cmd::ValidateData { templates, data, model, dialect: d } => {
+            let e = load(&templates, &d)?;
+            let errs = e.validate_data(&model, &read_data(&data)?).map_err(|e| e.0)?;
+            if errs.is_empty() {
+                println!("ok: {} is valid {model} data", data.display());
+                return Ok(());
+            }
+            for err in &errs { eprintln!("error: {err}"); }
+            Err(format!("{}: {} error(s)", data.display(), errs.len()))
         }
         Cmd::Schema { templates, model, dialect: d } => {
             let e = load(&templates, &d)?;

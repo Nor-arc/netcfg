@@ -22,6 +22,7 @@
 //! A `template NAME` section names its model; it may live anywhere in the set. Pairing is
 //! resolved when the set is built (`Engine::build`), not here.
 
+use crate::value::Value;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub struct FieldDef {
     pub type_spec: String,
     /// Default as written in the file (config tokens, or `true`/`false` for flags).
     pub default: Option<Vec<String>>,
+    /// Trailing `# ...` on the declaration line.
+    pub doc: Option<String>,
     pub line: usize,
 }
 
@@ -84,7 +87,8 @@ pub enum StructTok {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Alt {
-    Lit(String),
+    /// `"literal"`, optionally mapped to a data value: `"up" -> true`.
+    Lit(String, Option<Value>),
     Type(String),
 }
 
@@ -103,6 +107,8 @@ pub struct ModelDef {
     pub line: usize,
     /// Declared with `fragment` rather than `model`: spliced into models with `<< @Name >>`.
     pub fragment: bool,
+    /// The comment block directly above `model NAME` (no blank line between).
+    pub doc: Option<String>,
 }
 
 /// A `template NAME` section: config-shaped text for the model (or fragment) `NAME`.
@@ -139,11 +145,13 @@ pub fn is_ident(s: &str) -> bool {
 }
 
 /// Dedent template lines, keeping blank lines so line numbers map 1:1 to the file.
+/// `##` lines are template comments: they become blank lines and never reach the lexer.
 fn template_text(lines: &[(usize, &str)]) -> String {
+    let lines: Vec<(usize, &str)> = lines.iter().map(|&(n, l)| (n, if l.trim_start().starts_with("##") { "" } else { l })).collect();
     let min_indent = lines.iter().filter(|(_, l)| !l.trim().is_empty())
         .map(|(_, l)| l.len() - l.trim_start().len()).min().unwrap_or(0);
     let mut text = String::new();
-    for (_, l) in lines {
+    for (_, l) in &lines {
         if !l.trim().is_empty() { text.push_str(&l[min_indent.min(l.len() - l.trim_start().len())..]); }
         text.push('\n');
     }
@@ -165,6 +173,8 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
     let mut section = Section::None;
     // The most recent model/fragment in this file, for the deprecated bare `template`.
     let mut last_model: Option<String> = None;
+    // Top-level comment lines directly above the current line: a model's doc.
+    let mut comments: Vec<&str> = Vec::new();
 
     fn close(section: &mut Section<'_>, file: &mut File, errors: &mut Vec<String>, source: &str) {
         match std::mem::replace(section, Section::None) {
@@ -195,9 +205,15 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
             }
         }
         let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
+        if t.is_empty() {
+            comments.clear();
             continue;
         }
+        if t.starts_with('#') {
+            if !indented { comments.push(t.trim_start_matches('#').trim()); }
+            continue;
+        }
+        let doc = std::mem::take(&mut comments);
         if indented {
             match &mut section {
                 Section::Dialect(d) => match t.split_once(':') {
@@ -234,6 +250,7 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
                 section = Section::Model(ModelDef {
                     name: rest.to_string(), fields: Vec::new(), template: String::new(), template_line: ln,
                     template_source: source.to_string(), source: source.to_string(), line: ln, fragment: kw == "fragment",
+                    doc: if doc.is_empty() { None } else { Some(doc.join(" ")) },
                 });
             }
             "template" => {
@@ -310,11 +327,18 @@ pub fn parse_struct_body(body: &str) -> std::result::Result<Vec<StructTok>, Stri
 }
 
 /// Split an inline union spec (`asn | "auto" | ""`) into alternatives; a plain spec yields one type alt.
+/// A literal may map to a data value: `"up" -> true | "down" -> false`.
 pub fn parse_alts(spec: &str) -> std::result::Result<Vec<Alt>, String> {
     let mut alts = Vec::new();
     for part in spec.split('|').map(str::trim) {
+        let (part, mapped) = match part.split_once("->") {
+            Some((p, v)) => (p.trim(), Some(parse_mapped(v.trim())?)),
+            None => (part, None),
+        };
         if let Some(lit) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            alts.push(Alt::Lit(lit.to_string()));
+            alts.push(Alt::Lit(lit.to_string(), mapped));
+        } else if mapped.is_some() {
+            return Err(format!("`{part} -> ...`: only a \"quoted\" literal can be mapped to a value"));
         } else if is_ident(part) || part.starts_with("int(") || part.starts_with("list(") {
             alts.push(Alt::Type(part.to_string()));
         } else {
@@ -324,7 +348,36 @@ pub fn parse_alts(spec: &str) -> std::result::Result<Vec<Alt>, String> {
     Ok(alts)
 }
 
+/// Split a trailing `# comment` off a declaration line (a `#` inside quotes is literal).
+fn split_doc(t: &str) -> (&str, Option<String>) {
+    let mut quoted = false;
+    for (i, c) in t.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted => {
+                let doc = t[i..].trim_start_matches('#').trim();
+                return (t[..i].trim_end(), if doc.is_empty() { None } else { Some(doc.to_string()) });
+            }
+            _ => {}
+        }
+    }
+    (t, None)
+}
+
+/// The data side of `"literal" -> value`: true, false, an integer or a "quoted string".
+fn parse_mapped(v: &str) -> std::result::Result<Value, String> {
+    match v {
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
+        _ => {
+            if let Some(s) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) { return Ok(Value::Str(s.to_string())); }
+            v.parse::<i64>().map(Value::Int).map_err(|_| format!("`-> {v}`: a literal maps to true, false, an integer or a \"quoted string\""))
+        }
+    }
+}
+
 fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
+    let (t, doc) = split_doc(t);
     let (name, spec) = t.split_once(':').ok_or_else(|| Error(format!("expected `name: type`, got `{t}`")))?;
     let name = name.trim();
     if !is_ident(name) { return Err(Error(format!("`{name}` is not a valid field name"))); }
@@ -362,7 +415,7 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
         return Err(Error(format!("field `{name}`: only required values and flags can have a default")));
     }
     if type_spec.is_empty() { return Err(Error(format!("field `{name}`: missing type"))); }
-    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, line: ln })
+    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, doc, line: ln })
 }
 
 #[cfg(test)]
@@ -395,6 +448,19 @@ mod tests {
         assert_eq!(f.templates.iter().map(|t| (t.model.as_str(), t.first_line)).collect::<Vec<_>>(), vec![("B", 2), ("A", 11)]);
         let f = parse("t.nct", "fragment Common\n  mtu: int?\n\ntemplate Common\n  mtu {{ mtu }}\n").unwrap();
         assert!(f.models[0].fragment);
+    }
+
+    #[test]
+    fn docs_and_template_comments() {
+        let f = parse("t.nct", "# unrelated\n\n# A BGP neighbor.\n# One per peer.\nmodel N\n  peer: key ip   # the peer's address\n  mode: \"#a\" | \"b\"?  # quoted # is literal\n  x: int?\n\ntemplate N\n  ## a template comment\n  neighbor {{ peer }}\n    ## indented too\n    # literal\n").unwrap();
+        let m = &f.models[0];
+        assert_eq!(m.doc.as_deref(), Some("A BGP neighbor. One per peer."));
+        assert_eq!(m.fields[0].doc.as_deref(), Some("the peer's address"));
+        assert_eq!(m.fields[0].type_spec, "ip");
+        assert_eq!(m.fields[1].type_spec, "\"#a\" | \"b\"");
+        assert_eq!(m.fields[1].doc.as_deref(), Some("quoted # is literal"));
+        assert_eq!(m.fields[2].doc, None);
+        assert_eq!(f.templates[0].text, "\nneighbor {{ peer }}\n\n  # literal\n");
     }
 
     #[test]

@@ -26,13 +26,22 @@ template NeighborAf
     next-hop-self [[ nextHopSelf ]]
     soft-reconfiguration inbound [[ softReconfigInbound ]]
 
+# Session settings shared by neighbors and peer templates.
+fragment PeerSession
+  description: phrase?
+  updateSource: string?          # interface the session is sourced from
+  ebgpMultihop: int(2..255)?
+
+template PeerSession
+  description {{ description }}
+  update-source {{ updateSource }}
+  ebgp-multihop {{ ebgpMultihop }}
+
+# A BGP neighbor block.
 model Neighbor
   peer: key ip
-  remoteAs: asn?
+  remoteAs: asn?                 # peer's AS; may be inherited from a peer template
   inheritPeer: string?
-  description: phrase?
-  updateSource: string?
-  ebgpMultihop: int(2..255)?
   timers: {{ keepalive: int }} {{ hold: int }}?
   shutdown: flag
   addressFamilies: [NeighborAf]
@@ -41,9 +50,7 @@ template Neighbor
   neighbor {{ peer }}
     remote-as {{ remoteAs }}
     inherit peer {{ inheritPeer }}
-    description {{ description }}
-    update-source {{ updateSource }}
-    ebgp-multihop {{ ebgpMultihop }}
+    << @PeerSession >>
     timers {{ timers }}
     shutdown [[ shutdown ]]
     << addressFamilies >>
@@ -51,16 +58,11 @@ template Neighbor
 model PeerTemplate
   name: key string
   remoteAs: asn?
-  description: phrase?
-  updateSource: string?
-  ebgpMultihop: int(2..255)?
 
 template PeerTemplate
   template peer {{ name }}
     remote-as {{ remoteAs }}
-    description {{ description }}
-    update-source {{ updateSource }}
-    ebgp-multihop {{ ebgpMultihop }}
+    << @PeerSession >>
 
 model Bgp
   asn: key asn

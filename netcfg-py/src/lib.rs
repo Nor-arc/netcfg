@@ -135,6 +135,18 @@ impl Engine {
         self.core.explain(model).map_err(|e| PyValueError::new_err(e.0))
     }
 
+    /// Example YAML for a model: every field, typed placeholders, comments from the docs.
+    fn skeleton(&self, model: &str) -> PyResult<String> {
+        self.core.skeleton(model).map_err(|e| PyValueError::new_err(e.0))
+    }
+
+    /// Every problem with `value` as data for `model`, as messages (empty when valid).
+    /// The messages are the ones `render` raises, located by data path.
+    fn validate_data(&self, model: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        let v = from_py(value)?;
+        Ok(self.core.validate_data(model, &v).map_err(|e| PyValueError::new_err(e.0))?.into_iter().map(|e| e.0).collect())
+    }
+
     /// JSON Schema (as a dict) for a model's data.
     fn schema(&self, py: Python<'_>, model: &str) -> PyResult<PyObject> {
         let s = self.core.schema(model).map_err(|e| PyValueError::new_err(e.0))?;

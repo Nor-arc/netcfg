@@ -49,4 +49,11 @@ assert s.warnings and "template Ntp" in s.warnings[0]
 assert s.parse("D", "ntp server 10.0.0.1\n").value == {"ntp": {"server": "10.0.0.1"}}
 assert s.render("D", {}) == ""
 
+# Skeleton and data validation.
+sk = e.skeleton("Device")
+assert "ebgpMultihop: <int 2..255>  # optional" in sk, sk
+errs = e.validate_data("Device", {"hostname": "h", "bgp": [{"asn": 1, "neighbors": [{"peer": "10.0.0.1", "remoteAs": "x"}, {"peer": "nope"}]}]})
+assert len(errs) == 2 and "Device.bgp[0].neighbors[0]: field `remoteAs`" in errs[0], errs
+assert e.validate_data("Device", r.value) == []
+
 print("ok")

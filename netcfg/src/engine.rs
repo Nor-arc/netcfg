@@ -131,6 +131,7 @@ enum CShape {
 pub struct Compiled {
     pub name: String,
     pub fields: Vec<FieldDef>,
+    pub doc: Option<String>,
     shape: CShape,
     /// `@ignore` prefixes: for blocks/roots they apply to the body; for flat groups to the parent level.
     ignores: Vec<Vec<String>>,
@@ -245,12 +246,49 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        let defs: Vec<&model::ModelDef> = defs.iter().filter(|d| !d.fragment).collect();
+        let rest = |f: &FieldDef| catalog.resolve(&f.type_spec).map(|t| t.rest_of_line()).unwrap_or(false);
+        // Fragments: validated on their own (as unkeyed bodies), then spliced where included.
+        let mut frags: IndexMap<&str, (&model::ModelDef, Vec<TLine>)> = IndexMap::new();
+        for d in defs.iter().filter(|d| d.fragment) {
+            let mut errs: Vec<String> = Vec::new();
+            for f in &d.fields {
+                if f.kind == Kind::Key { errs.push(format!("field `{}`: a fragment has no identity of its own, so it cannot declare keys", f.name)); }
+                if f.kind.is_nested() { errs.push(format!("field `{}`: fragments may not contain nested models", f.name)); }
+            }
+            let mut lines = template::from_nodes(&dialect.lex_template(&d.template), d.template_line).unwrap_or_else(|es| { errs.extend(es); Vec::new() });
+            fn mark(ls: &mut [TLine], name: &str, errs: &mut Vec<String>) {
+                for l in ls.iter_mut() {
+                    l.origin = Some(name.to_string());
+                    if let Some(inc) = l.include() { errs.push(format!("{} `<< @{inc} >>`: fragments may not include other fragments", l.at())); }
+                    mark(&mut l.children, name, errs);
+                }
+            }
+            mark(&mut lines, &d.name, &mut errs);
+            if errs.is_empty() { errs.extend(template::validate(&d.name, &lines, &d.fields, &rest, dialect.negation.as_deref())); }
+            if errs.is_empty() { frags.insert(&d.name, (d, lines)); }
+            else { errors.push(format!("{}:{} fragment {}: \n  - {}", d.source, d.line, d.name, errs.join("\n  - "))); }
+        }
+        if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
+        let model_names: Vec<String> = defs.iter().filter(|d| !d.fragment).map(|d| d.name.clone()).collect();
+        let defs: Vec<model::ModelDef> = defs.iter().filter(|d| !d.fragment).cloned().collect();
+        // Splice fragments into each model: their lines at the include, their fields merged.
+        let mut spliced: Vec<Vec<TLine>> = Vec::new();
+        let mut defs = defs;
+        for d in defs.iter_mut() {
+            let mut errs = Vec::new();
+            let lines = template::from_nodes(&dialect.lex_template(&d.template), d.template_line).unwrap_or_else(|es| { errs.extend(es); Vec::new() });
+            let mut bound: Vec<String> = Vec::new();
+            let lines = expand_fragments(lines, &mut d.fields, &frags, &model_names, &mut bound, &mut errs);
+            if !errs.is_empty() { errors.push(format!("{}:{} model {}: \n  - {}", d.source, d.line, d.name, errs.join("\n  - "))); }
+            spliced.push(lines);
+        }
+        if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
+        let defs: Vec<&model::ModelDef> = defs.iter().collect();
         let index: IndexMap<&str, usize> = defs.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
         let is_keyed = |name: &str| index.get(name).map(|&i| defs[i].fields.iter().any(|f| f.kind == Kind::Key));
 
         let mut models: IndexMap<String, Compiled> = IndexMap::new();
-        for d in &defs {
+        for (d, lines) in defs.iter().zip(spliced) {
             let ctx = |m: String| format!("{}:{} model {}: {m}", d.source, d.line, d.name);
             let mut errs: Vec<String> = Vec::new();
             // Resolve types.
@@ -280,12 +318,6 @@ impl Engine {
                     },
                 }
             }
-            let rest = |f: &FieldDef| catalog.resolve(&f.type_spec).map(|t| t.rest_of_line()).unwrap_or(false);
-            let nodes = dialect.lex_template(&d.template);
-            let lines = match template::from_nodes(&nodes, d.template_line) {
-                Ok(l) => l,
-                Err(es) => { errs.extend(es); Vec::new() }
-            };
             if !lines.is_empty() {
                 errs.extend(template::validate(&d.name, &lines, &d.fields, &rest, dialect.negation.as_deref()));
             }
@@ -363,6 +395,42 @@ impl Engine {
     }
 }
 
+/// Replace `<< @Fragment >>` lines with the fragment's lines and merge its fields into
+/// `fields`, after the last field bound above the include (so data keeps template order).
+/// `bound` collects the field names bound so far, in document order.
+fn expand_fragments(lines: Vec<TLine>, fields: &mut Vec<FieldDef>, frags: &IndexMap<&str, (&model::ModelDef, Vec<TLine>)>, models: &[String], bound: &mut Vec<String>, errs: &mut Vec<String>) -> Vec<TLine> {
+    let mut out = Vec::new();
+    for mut l in lines {
+        let Some(name) = l.include().map(str::to_string) else {
+            bound.extend(l.holes().into_iter().map(String::from));
+            let kids = std::mem::take(&mut l.children);
+            l.children = expand_fragments(kids, fields, frags, models, bound, errs);
+            out.push(l);
+            continue;
+        };
+        let Some((frag, flines)) = frags.get(name.as_str()) else {
+            if models.contains(&name) { errs.push(format!("{} `<< @{name} >>`: {name} is a model, not a fragment; nest it with a field (`x: {name}?` or `x: [{name}]`) and << x >>", l.at())); }
+            else { errs.push(format!("{} `<< @{name} >>`: no fragment {name} (fragments: {})", l.at(), frags.keys().copied().collect::<Vec<_>>().join(", "))); }
+            continue;
+        };
+        let mut at = bound.iter().filter_map(|b| fields.iter().position(|f| &f.name == b)).max().map(|i| i + 1).unwrap_or(0);
+        for f in &frag.fields {
+            if fields.iter().any(|g| g.name == f.name) {
+                errs.push(format!("{} `<< @{name} >>`: field `{}` of fragment {name} is already a field here", l.at(), f.name));
+                continue;
+            }
+            fields.insert(at, f.clone());
+            at += 1;
+        }
+        for fl in flines {
+            fn holes(l: &TLine, bound: &mut Vec<String>) { bound.extend(l.holes().into_iter().map(String::from)); for c in &l.children { holes(c, bound); } }
+            holes(fl, bound);
+            out.push(fl.clone());
+        }
+    }
+    out
+}
+
 /// A set's template files: `*.nct` (and deprecated `*.ttp`), but not `*.test.nct` test files.
 pub fn is_template_file(p: &std::path::Path) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -406,7 +474,13 @@ fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<V
     let mut resolved = Vec::new();
     for a in alts {
         match a {
-            model::Alt::Lit(l) => resolved.push(Alt::Lit(l.clone())),
+            model::Alt::Lit(l, mapped) => {
+                let value = mapped.clone().unwrap_or_else(|| Value::Str(l.clone()));
+                if let Some(Alt::Lit(other, _)) = resolved.iter().find(|a| matches!(a, Alt::Lit(_, v) if *v == value)) {
+                    return Err(format!("\"{other}\" and \"{l}\" both map to {}; each literal needs its own value so rendering can pick one", fmt_value(&value)));
+                }
+                resolved.push(Alt::Lit(l.clone(), value));
+            }
             model::Alt::Type(n) => match catalog.resolve(n) {
                 Some(ty) if ty.rest_of_line() => return Err(format!("`{n}` consumes the rest of the line and cannot be a union alternative")),
                 Some(ty) => resolved.push(Alt::Type(ty)),
@@ -425,7 +499,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         Pattern { toks: toks.iter().filter_map(|t| match t {
             Tok::Lit(s) => Some(PTok::Lit(s.clone())),
             Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
-            Tok::Flag(_) | Tok::Nest(_) => None,
+            Tok::Flag(_) | Tok::Nest(_) | Tok::Include(_) => None,
         }).collect() }
     };
     let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -445,7 +519,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             Pattern { toks: toks.iter().filter_map(|t| match t {
                 Tok::Lit(s) => Some(PTok::Lit(s.clone())),
                 Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
-                Tok::Flag(_) | Tok::Nest(_) => None, // zero-width: the line's presence is the value
+                Tok::Flag(_) | Tok::Nest(_) | Tok::Include(_) => None, // zero-width: the line's presence is the value
             }).collect() }
         };
         let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -503,7 +577,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
     };
     // Defaults must parse even when the field is on a multi-value line or the header.
     for f in fields { default_value(f)?; }
-    Ok(Compiled { name: d.name.clone(), fields: fields.clone(), shape, ignores, field_types: field_types.to_vec() })
+    Ok(Compiled { name: d.name.clone(), fields: fields.clone(), doc: d.doc.clone(), shape, ignores, field_types: field_types.to_vec() })
 }
 
 // ---- parsing --------------------------------------------------------------------------------
@@ -872,110 +946,161 @@ impl Engine {
     }
 
     pub fn render_nodes(&self, model: &str, value: &Value) -> Result<Vec<OwnedNode>> {
-        let mi = self.model_idx(model)?;
-        let rec = value.as_record().ok_or_else(|| Error(format!("{model}: expected a record")))?;
-        self.render_one(&self.models[mi], rec).map_err(|e| Error(format!("{model}: {}", e.0)))
+        let (nodes, errs) = self.render_checked(model, value)?;
+        match errs.into_iter().next() { Some(e) => Err(e), None => Ok(nodes) }
     }
 
-    fn render_one(&self, m: &Compiled, rec: &Record) -> Result<Vec<OwnedNode>> {
+    /// Every problem with `value` as data for `model` (unknown or missing fields, wrong
+    /// types, struct shapes, duplicate keys), in document order; empty when the data is valid.
+    /// This is the render path with output discarded, so messages are the ones `render` gives.
+    pub fn validate_data(&self, model: &str, value: &Value) -> Result<Vec<Error>> {
+        Ok(self.render_checked(model, value)?.1)
+    }
+
+    fn render_checked(&self, model: &str, value: &Value) -> Result<(Vec<OwnedNode>, Vec<Error>)> {
+        let mi = self.model_idx(model)?;
+        let mut errs = Vec::new();
+        let nodes = match value.as_record() {
+            Some(rec) => self.render_one(&self.models[mi], rec, model, &mut errs),
+            None => { errs.push(Error(format!("{model}: expected a record, got {}", value.to_json()))); Vec::new() }
+        };
+        Ok((nodes, errs))
+    }
+
+    /// Render one record of `m`. `path` locates it in the data (`Device.bgp[0]`); problems are
+    /// pushed to `errs` and the offending part is skipped.
+    fn render_one(&self, m: &Compiled, rec: &Record, path: &str, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+        for k in rec.keys() {
+            if !m.fields.iter().any(|f| &f.name == k) {
+                errs.push(Error(format!("{path}: unknown field `{k}` ({} fields: {})", m.name, m.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "))));
+            }
+        }
         match &m.shape {
-            CShape::Root { body } => self.render_body(m, body, rec),
-            CShape::Block { header, body, .. } => Ok(vec![OwnedNode::with_children(header.render(&m.fields, rec)?, self.render_body(m, body, rec)?)]),
+            CShape::Root { body } => self.render_body(m, body, rec, path, errs),
+            CShape::Block { header, body, .. } => match header.render(&m.fields, rec) {
+                Ok(h) => vec![OwnedNode::with_children(h, self.render_body(m, body, rec, path, errs))],
+                Err(e) => { errs.push(Error(format!("{path}: {}", e.0))); Vec::new() }
+            },
             CShape::Flat { keys, lines } => {
-                let prefix = keys.render(&m.fields, rec)?;
-                let mut out = Vec::new();
-                for n in self.render_body(m, lines, rec)? {
-                    let (negated, toks) = match n.tokens.first().map(String::as_str) { Some("no") => (true, &n.tokens[1..]), _ => (false, &n.tokens[..]) };
-                    let mut t: Vec<String> = if negated { vec!["no".to_string()] } else { Vec::new() };
+                let prefix = match keys.render(&m.fields, rec) {
+                    Ok(p) => p,
+                    Err(e) => { errs.push(Error(format!("{path}: {}", e.0))); return Vec::new(); }
+                };
+                let neg = self.dialect.negation.as_deref();
+                self.render_body(m, lines, rec, path, errs).into_iter().map(|n| {
+                    // Flat lines carry the key after the negation word: `no neighbor X shutdown`.
+                    let negated = neg.is_some() && n.tokens.first().map(String::as_str) == neg;
+                    let mut t: Vec<String> = if negated { vec![n.tokens[0].clone()] } else { Vec::new() };
                     t.extend(prefix.iter().cloned());
-                    t.extend(toks.iter().cloned());
-                    out.push(OwnedNode::leaf(t));
-                }
-                Ok(out)
+                    t.extend(n.tokens[negated as usize..].iter().cloned());
+                    OwnedNode::leaf(t)
+                }).collect()
             }
         }
     }
 
-    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record) -> Result<Vec<OwnedNode>> {
+    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record, path: &str, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
         let mut out = Vec::new();
+        macro_rules! fail {
+            ($($arg:tt)*) => {{ errs.push(Error(format!("{path}: {}", format!($($arg)*)))); continue; }};
+        }
         for slot in slots {
             match slot {
                 Slot::Line { pat, mode } => {
                     let hole_fields = pat.hole_fields();
                     let present = hole_fields.iter().filter(|&&i| rec.get(&m.fields[i].name).map(|v| !v.is_null()).unwrap_or(false)).count();
                     let nulls = hole_fields.iter().filter(|&&i| rec.get(&m.fields[i].name).map(Value::is_null).unwrap_or(false)).count();
+                    let negated = |neg: &String| OwnedNode::leaf(std::iter::once(neg.clone()).chain(pat.literal_prefix().iter().map(|s| s.to_string())).collect());
                     match mode {
-                        Mode::Opt => {
-                            if present == 0 {
-                                if nulls > 0 {
-                                    // `null` means "explicitly negated": write the negated form.
-                                    match &self.dialect.negation {
-                                        Some(n) => out.push(OwnedNode::leaf(std::iter::once(n.clone()).chain(pat.literal_prefix().iter().map(|s| s.to_string())).collect())),
-                                        None => return Err(Error(format!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name))),
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        Mode::Default(d) => {
-                            if nulls > 0 {
-                                match &self.dialect.negation {
-                                    Some(n) => { out.push(OwnedNode::leaf(std::iter::once(n.clone()).chain(pat.literal_prefix().iter().map(|s| s.to_string())).collect())); continue; }
-                                    None => return Err(Error(format!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name))),
-                                }
-                            }
-                            if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; }
-                        }
-                        Mode::Required => { if present < hole_fields.len() { return Err(Error(format!("required line `{}`: field(s) missing", pat.show(&m.fields)))); } }
+                        Mode::Opt | Mode::Default(_) if nulls > 0 => match &self.dialect.negation {
+                            // `null` means "explicitly negated": write the negated form.
+                            Some(n) => { out.push(negated(n)); continue; }
+                            None => fail!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name),
+                        },
+                        Mode::Opt => if present == 0 { continue; },
+                        Mode::Default(d) => if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; },
+                        Mode::Required => if present < hole_fields.len() {
+                            let missing: Vec<&str> = hole_fields.iter().map(|&i| m.fields[i].name.as_str()).filter(|n| rec.get(*n).map(Value::is_null).unwrap_or(true)).collect();
+                            fail!("required line `{}`: field(s) missing: {}", pat.show(&m.fields), missing.join(", "));
+                        },
                     }
-                    out.push(OwnedNode::leaf(pat.render(&m.fields, rec)?));
+                    match pat.render(&m.fields, rec) {
+                        Ok(t) => out.push(OwnedNode::leaf(t)),
+                        Err(e) => fail!("{}", e.0),
+                    }
                 }
                 Slot::Flag { lits, field, default } => {
                     let v = match rec.get(&m.fields[*field].name) {
                         None | Some(Value::Null) => *default,
                         Some(Value::Bool(b)) => *b,
-                        Some(v) => return Err(Error(format!("field `{}`: expected true/false, got {v:?}", m.fields[*field].name))),
+                        Some(v) => fail!("field `{}`: expected true/false, got {}", m.fields[*field].name, v.to_json()),
                     };
                     if v == *default { continue; }
                     if !v && (self.dialect.negation.is_none() || self.literal_no(lits)) {
-                        return Err(Error(format!("field `{}`: false has no spelling in this dialect (there is no negation for `{}`)", m.fields[*field].name, lits.show(&m.fields))));
+                        fail!("field `{}`: false has no spelling in this dialect (there is no negation for `{}`)", m.fields[*field].name, lits.show(&m.fields));
                     }
                     let mut toks = if v { Vec::new() } else { vec![self.dialect.negation.clone().unwrap()] };
-                    toks.extend(lits.render(&m.fields, rec)?);
+                    match lits.render(&m.fields, rec) {
+                        Ok(t) => toks.extend(t),
+                        Err(e) => fail!("{}", e.0),
+                    }
                     out.push(OwnedNode::leaf(toks));
                 }
                 Slot::Container { lits, body, .. } => {
-                    let children = self.render_body(m, body, rec)?;
+                    let children = self.render_body(m, body, rec, path, errs);
                     if !children.is_empty() {
-                        out.push(OwnedNode { tokens: lits.render(&m.fields, rec)?, children, block: false });
+                        match lits.render(&m.fields, rec) {
+                            Ok(t) => out.push(OwnedNode { tokens: t, children, block: false }),
+                            Err(e) => fail!("{}", e.0),
+                        }
                     }
                 }
                 Slot::Nested { field, model, card: Card::Single { required } } => {
                     let name = &m.fields[*field].name;
                     let sub = &self.models[*model];
                     match rec.get(name) {
-                        None | Some(Value::Null) if *required => return Err(Error(format!("field `{name}` is missing (a required {})", sub.name))),
+                        None | Some(Value::Null) if *required => fail!("field `{name}` is missing (a required {})", sub.name),
                         None | Some(Value::Null) => {}
-                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r).map_err(|e| Error(format!("{}: {}", sub.name, e.0)))?),
-                        Some(v) => return Err(Error(format!("field `{name}`: expected a record ({}), got {v:?}", sub.name))),
+                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r, &format!("{path}.{name}"), errs)),
+                        Some(v) => fail!("field `{name}`: expected a record ({}), got {}", sub.name, v.to_json()),
                     }
                 }
                 Slot::Nested { field, model, card: Card::Many } => {
-                    let items = match rec.get(&m.fields[*field].name) {
+                    let name = &m.fields[*field].name;
+                    let items = match rec.get(name) {
                         None | Some(Value::Null) => continue,
                         Some(Value::List(l)) => l,
-                        Some(v) => return Err(Error(format!("field `{}`: expected a list, got {v:?}", m.fields[*field].name))),
+                        Some(v) => fail!("field `{name}`: expected a list of {}, got {}", self.models[*model].name, v.to_json()),
                     };
                     let sub = &self.models[*model];
-                    for it in items {
-                        let r = it.as_record().ok_or_else(|| Error(format!("field `{}`: expected records", m.fields[*field].name)))?;
-                        out.extend(self.render_one(sub, r).map_err(|e| Error(format!("{}: {}", sub.name, e.0)))?);
+                    let key_fields: Vec<&str> = sub.fields.iter().filter(|f| f.kind == Kind::Key).map(|f| f.name.as_str()).collect();
+                    let mut seen: IndexMap<Vec<Option<&Value>>, usize> = IndexMap::new();
+                    for (i, it) in items.iter().enumerate() {
+                        let at = format!("{path}.{name}[{i}]");
+                        let Some(r) = it.as_record() else {
+                            errs.push(Error(format!("{at}: expected a {} record, got {}", sub.name, it.to_json())));
+                            continue;
+                        };
+                        let key: Vec<Option<&Value>> = key_fields.iter().map(|k| r.get(*k)).collect();
+                        if !key_fields.is_empty() && key.iter().all(Option::is_some) {
+                            if let Some(j) = seen.get(&key) {
+                                errs.push(Error(format!("{at}: duplicate {} (same {} as {name}[{j}])", sub.name, key_fields.join(", "))));
+                                continue;
+                            }
+                            seen.insert(key, i);
+                        }
+                        out.extend(self.render_one(sub, r, &at, errs));
                     }
                 }
             }
         }
-        Ok(out)
+        out
     }
+}
+
+/// A field's doc as one line under its `explain` heading.
+fn doc_line(f: &FieldDef, out: &mut String) {
+    if let Some(doc) = &f.doc { out.push_str(&format!("  # {doc}\n")); }
 }
 
 fn fmt_value(v: &Value) -> String {
@@ -1008,6 +1133,7 @@ impl Engine {
                         let names: Vec<&str> = pat.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(m.fields[*field].name.as_str()), _ => None }).collect();
                         let kind = match mode { Mode::Required => "required".to_string(), Mode::Opt => "optional".to_string(), Mode::Default(d) => format!("default {}", fmt_value(d)) };
                         out.push_str(&format!("{} ({kind})\n", names.join(", ")));
+                        for f in pat.hole_fields() { doc_line(&m.fields[f], out); }
                         out.push_str(&format!("  value    → {prefix}{}\n", show(pat)));
                         match mode {
                             Mode::Opt => {
@@ -1025,6 +1151,7 @@ impl Engine {
                         let f = &m.fields[*field];
                         let literal_no = e.literal_no(lits);
                         out.push_str(&format!("{} (flag, default {default})\n", f.name));
+                        doc_line(f, out);
                         let pos = format!("{prefix}{}", show(lits));
                         let write = |v: bool| if v == *default { "  (nothing written: default)" } else { "" };
                         if literal_no {
@@ -1040,11 +1167,13 @@ impl Engine {
                     }
                     Slot::Nested { field, model, card: Card::Many } => {
                         out.push_str(&format!("{} (list of {})\n", m.fields[*field].name, e.models[*model].name));
+                        doc_line(&m.fields[*field], out);
                         out.push_str(&format!("  each     → {prefix}one {} block/group\n", e.models[*model].name));
                     }
                     Slot::Nested { field, model, card: Card::Single { required } } => {
                         let sub = &e.models[*model];
                         out.push_str(&format!("{} (single {}, {})\n", m.fields[*field].name, sub.name, if *required { "required" } else { "optional" }));
+                        doc_line(&m.fields[*field], out);
                         out.push_str(&format!("  value    → {prefix}one {} block/group (a second is an error)\n", sub.name));
                         if !*required { out.push_str("  missing  → (nothing written)\n"); }
                     }
@@ -1055,6 +1184,7 @@ impl Engine {
             }
         }
         out.push_str(&format!("{} ({} dialect)\n", m.name, self.dialect.name));
+        if let Some(doc) = &m.doc { out.push_str(&format!("# {doc}\n")); }
         match &m.shape {
             CShape::Root { body } => walk(self, m, body, "", &show, neg, &mut out),
             CShape::Block { header, key_fields, body } => {

@@ -70,15 +70,63 @@ Templates use three placeholder markers, one per kind of field:
 | `type name = /regex/` | One-token type validated by a regex. |
 | `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
 | `type name = asn \| "auto"` | Union: alternatives tried in order; bare names are types, quoted words are literals. |
+| `type state = "up" -> true \| "down" -> false` | Enum with data mapping: a literal maps to a data value (`true`/`false`, an integer, or a `"quoted string"`); without `->` it maps to itself. Rendering picks the literal whose value matches; two literals mapping to the same value is a load error. The JSON Schema `enum` lists the data values. |
 | `type name = string \| ""` | An empty literal matches nothing at the end of the line: a value that may be present without a value (`neighbor X group` vs `neighbor X group CORE`, data `""` vs `"CORE"`). Must be the last placeholder. |
 | `type name = {{ limit: int }} {{ action: "warning-only" \| "" }}` | Struct type: a value's own little template. Data is a record (`{limit: 1200, action: warning-only}`); sub-fields whose type allows `""` may sit anywhere and are omitted when absent. Placeholders may use inline unions. |
 | `f: {{ limit: int }} {{ action: "warning-only" \| "" }}?` | Anonymous struct on a field, for one-off shapes; `type` is for reused ones. |
 | `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
+| `fragment Name` + `<< @Name >>` | A reusable run of body lines with its own fields and no identity (see below). |
 
 Builtin types: `string`, `int`, `int(lo..hi)`, `list(T)`, `phrase` (free text to the end of the line), `ipv4`, `ipv6`, `ip` (either), `cidr` (dialect-dependent: `addr/len` on NX-OS/EOS, `addr mask` on IOS; the value is always `addr/len`), `ipv6cidr`, `prefix` (either), `asn` (asplain or asdot in, asplain out). Numbers are integers only. Domain types with real parsing logic are added in Rust by implementing the `Scalar` trait.
 
 `names`, `ints` and `intpair` were removed in 0.4: write `list(string)`, `list(int)`, and a struct with named parts (`timers: {{ keepalive: int }} {{ hold: int }}?`, data `{keepalive: 10, hold: 30}` instead of `[10, 30]`). The loader names the replacement if an old type is used. Note that `list(int)` validates every element, so config with a non-integer in such a position is now a strict error rather than accepted.
+
+### Documentation and comments
+
+```text
+# A BGP neighbor block.                  <- a comment block directly above `model` is its doc
+model Neighbor
+  peer: key ip
+  remoteAs: asn?  # peer's AS; may be inherited from a peer template
+
+template Neighbor
+  ## Lines starting with `##` are template comments; they are dropped before lexing.
+  neighbor {{ peer }}
+    remote-as {{ remoteAs }}
+```
+
+Docs appear in the JSON Schema (`description`), in `netcfg explain` (a `#` line under the
+field) and in `netcfg skeleton`. Inside template text a single `#` is an ordinary literal
+token (`description # {{ d }}` matches `description # to core`); only `##` starts a
+comment, so dialects that use `#` in config are unaffected. Outside template text, `#`
+starts a comment as before.
+
+### Fragments
+
+```text
+fragment PeerSession
+  description: phrase?
+  updateSource: string?
+  ebgpMultihop: int(2..255)?
+
+template PeerSession
+  description {{ description }}
+  update-source {{ updateSource }}
+  ebgp-multihop {{ ebgpMultihop }}
+
+template Neighbor
+  neighbor {{ peer }}
+    remote-as {{ remoteAs }}
+    << @PeerSession >>
+```
+
+At load the fragment's lines are spliced in at `<< @PeerSession >>` and its fields are merged
+into the including model, placed after the fields bound above the include so the data keeps
+template order. A field name that the model already has is an error. Fragments have no keys,
+may not contain nested models (`<< >>`) and may not include other fragments. Errors inside a
+fragment name it: `fragment PeerSession line 8 ...`. The NX-OS example shares `PeerSession`
+between `Neighbor` and `PeerTemplate`.
 
 Template shapes are inferred: one header line with nested lines is a **block**; several sibling lines that all carry the key are a **flat group** (EOS/IOS `neighbor X …` lines); a model without keys is a **root** document.
 
@@ -126,6 +174,15 @@ With `negation: no` declared in the dialect, every value line has a negated form
 
 Parsing `no <the line's literals>` yields `null` for an optional field (and the default for a defaulted one); `null` in intent data renders the negated form, which is also the command that clears the setting on the device. A missing key writes nothing. Flags follow the same idea with `true`/`false`: `no shutdown` is `false`, and a flag is written when its value differs from its declared default, so declare the *device's* default (`shutdown: flag = true` on platforms that shut interfaces by default). Writing `no shutdown [[ shutdown ]]` in a template is allowed for readability and changes nothing. `netcfg explain` prints this table for any model, and the JSON Schema marks optional fields nullable when the dialect has a negation word.
 
+## Data validation
+
+`render` and `validate-data` apply the same checks to data: unknown fields, wrong types,
+missing required fields, struct shapes, and duplicate keys within a collection. Every message
+carries the data path (`Device.bgp[0].neighbors[1]: field `remoteAs`: "x" is not an AS
+number`). `render` stops at the first problem; `validate-data` (and
+`Engine::validate_data`) reports all of them. Since 0.4 `render` rejects unknown fields
+instead of ignoring them.
+
 ## Matching rules
 
 Every line under a block the model owns ends up in exactly one place: **claimed** by the first template line that fully matches (template order); an **error** if it starts like a managed line (literals and key placeholders up to the first value placeholder match) but nothing fully matches, since silently leaving the field at its default would misrepresent the device; otherwise **unmanaged**, reported with its ancestors (`router bgp 65000 > neighbor 10.1.0.1 > bfd`). `@ignore` prefixes are checked first and always win. Headers are never strict: a `route-map` line whose sequence number doesn't decode is simply not one of ours.
@@ -139,6 +196,8 @@ netcfg parse   templates/nxos running.cfg --model Device --format yaml --unmanag
 netcfg render  templates/nxos intent.yaml  --model Device
 netcfg explain templates/ios  --model Interface     # how each field is spelled: value, absent, true/false, defaults
 netcfg schema  templates/nxos --model Device        # JSON Schema for editor completion/validation
+netcfg skeleton templates/nxos --model Device       # example YAML: every field, typed placeholders, docs
+netcfg validate-data templates/nxos intent.yaml --model Device   # check data without rendering; every error
 netcfg bench   templates/nxos running.cfg --model Device --runs 5
 netcfg fmt     templates/                           # named templates, each after its model (--check, --keep-order)
 ```
@@ -159,6 +218,8 @@ e = netcfg.Engine("templates/nxos")            # dialect comes from the template
 r = e.parse("Device", text)      # r.value: dict, r.unmanaged: list of paths; ValueError on bad config
 text = e.render("Device", r.value)
 schema = e.schema("Device")
+print(e.skeleton("Device"))      # example YAML
+errors = e.validate_data("Device", intent)   # [] when valid; same messages render raises
 ```
 The GIL is released during `parse` and `render`, so a thread pool parallelises across cores.
 `netcfg-py/smoke.py` exercises the installed wheel (`python netcfg-py/smoke.py`).
@@ -188,6 +249,7 @@ netcfg/src/fmt.rs        `netcfg fmt`: rewrite files to named templates
 netcfg/src/template.rs   template text parser, shape inference, validation (pure functions)
 netcfg/src/engine.rs     compile to patterns/slots; strict node-major parse; render
 netcfg/src/schema.rs     JSON Schema from model declarations
+netcfg/src/skeleton.rs   example YAML for a model
 netcfg/src/main.rs       CLI
 netcfg-py/               PyO3 bindings (maturin)
 templates/{ios,nxos,eos,junos} example dialects and models

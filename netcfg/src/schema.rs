@@ -46,9 +46,15 @@ impl Engine {
                     s
                 }
             };
+            let s = match (&f.doc, s) {
+                (Some(doc), J::Object(mut o)) => { o.insert("description".into(), J::String(doc.clone())); J::Object(o) }
+                (_, s) => s,
+            };
             props.insert(f.name.clone(), s);
             if matches!(f.kind, Kind::Key | Kind::Scalar | Kind::Single { required: true }) && f.default.is_none() { required.push(J::String(f.name.clone())); }
         }
-        json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+        let mut out = json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
+        if let Some(doc) = &m.doc { out["description"] = J::String(doc.clone()); }
+        out
     }
 }

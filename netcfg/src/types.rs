@@ -24,6 +24,18 @@ pub trait Scalar: Send + Sync {
     fn describe(&self) -> String {
         self.name().to_string()
     }
+    /// Extra detail for docs and skeletons: a union's alternatives, a regex.
+    fn hint(&self) -> Option<String> {
+        None
+    }
+    /// A struct type's named parts, in order.
+    fn parts(&self) -> Vec<(&str, &ScalarRef)> {
+        Vec::new()
+    }
+    /// A list type's element type.
+    fn elem(&self) -> Option<&ScalarRef> {
+        None
+    }
 }
 
 pub type ScalarRef = Arc<dyn Scalar>;
@@ -32,7 +44,7 @@ fn one<'a>(toks: &[&'a str], what: &str) -> Result<&'a str, String> {
     toks.first().copied().ok_or_else(|| format!("expected {what}, found end of line"))
 }
 fn expect_str<'a>(v: &'a Value, ty: &str) -> Result<&'a str, String> {
-    v.as_str().ok_or_else(|| format!("expected a string for {ty}, got {v:?}"))
+    v.as_str().ok_or_else(|| format!("expected a string for {ty}, got {}", v.to_json()))
 }
 fn json_str(pattern: Option<&str>, description: &str) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -61,6 +73,9 @@ impl Scalar for Str {
 struct Int { min: i64, max: i64 }
 impl Scalar for Int {
     fn name(&self) -> &str { "int" }
+    fn describe(&self) -> String {
+        if self.min == i64::MIN && self.max == i64::MAX { "int".into() } else { format!("int({}..{})", self.min, self.max) }
+    }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         let w = one(t, "an integer")?;
         let i: i64 = w.parse().map_err(|_| format!("'{w}' is not an integer"))?;
@@ -68,7 +83,7 @@ impl Scalar for Int {
         Ok((Value::Int(i), 1))
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        match v { Value::Int(i) => Ok(vec![i.to_string()]), _ => Err(format!("expected an integer, got {v:?}")) }
+        match v { Value::Int(i) => Ok(vec![i.to_string()]), _ => Err(format!("expected an integer, got {}", v.to_json())) }
     }
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "integer", "minimum": self.min, "maximum": self.max})
@@ -199,7 +214,7 @@ impl Scalar for Asn {
         Ok((Value::Int(parse_asn(w).ok_or_else(|| format!("'{w}' is not an AS number"))?), 1))
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        match v { Value::Int(i) if (1..=4294967295).contains(i) => Ok(vec![i.to_string()]), _ => Err(format!("{v:?} is not an AS number")) }
+        match v { Value::Int(i) if (1..=4294967295).contains(i) => Ok(vec![i.to_string()]), _ => Err(format!("{} is not an AS number", v.to_json())) }
     }
     fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}) }
 }
@@ -224,6 +239,7 @@ impl Scalar for Phrase {
 pub struct RegexType { pub name: String, pub source: String, pub re: Regex }
 impl Scalar for RegexType {
     fn name(&self) -> &str { &self.name }
+    fn hint(&self) -> Option<String> { Some(format!("/{}/", self.source)) }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         let w = one(t, &self.name)?;
         if self.re.is_match(w) { Ok((Value::Str(w.to_string()), 1)) } else { Err(format!("'{w}' is not a valid {} (/{}/)", self.name, self.re.as_str())) }
@@ -235,31 +251,38 @@ impl Scalar for RegexType {
     fn schema(&self) -> serde_json::Value { json_str(Some(&format!("^{}$", self.source)), &self.name) }
 }
 
-/// One alternative of a union: a literal token or another type.
+/// One alternative of a union: a literal token (with the data value it stands for) or
+/// another type.
 pub enum Alt {
-    Lit(String),
+    Lit(String, Value),
     Type(ScalarRef),
 }
 
 /// A user-defined disjunction: `type action = "permit" | "deny"`,
-/// `type prependItem = asn | "auto"`. Alternatives are tried in order.
+/// `type prependItem = asn | "auto"`, `type state = "up" -> true | "down" -> false`.
+/// Alternatives are tried in order; a literal parses to its mapped value (itself by default).
 pub struct UnionType { pub name: String, pub alts: Vec<Alt> }
 impl UnionType {
     fn describe_alts(&self) -> String {
-        self.alts.iter().map(|a| match a { Alt::Lit(l) => format!("\"{l}\""), Alt::Type(t) => t.name().to_string() }).collect::<Vec<_>>().join(" | ")
+        self.alts.iter().map(|a| match a {
+            Alt::Lit(l, Value::Str(v)) if v == l => format!("\"{l}\""),
+            Alt::Lit(l, v) => format!("\"{l}\" -> {}", v.to_json()),
+            Alt::Type(t) => t.describe(),
+        }).collect::<Vec<_>>().join(" | ")
     }
 }
 impl Scalar for UnionType {
     fn name(&self) -> &str { &self.name }
     /// `""` as an alternative means "nothing". On a template line such a placeholder must be
     /// last (only the end of the line is unambiguous); inside a struct type it may sit anywhere.
-    fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l) if l.is_empty())) }
+    fn allows_empty(&self) -> bool { self.alts.iter().any(|a| matches!(a, Alt::Lit(l, _) if l.is_empty())) }
     fn rest_of_line(&self) -> bool { self.allows_empty() }
+    fn hint(&self) -> Option<String> { Some(self.describe_alts()) }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         for a in &self.alts {
             match a {
-                Alt::Lit(l) if l.is_empty() => return Ok((Value::Str(String::new()), 0)),
-                Alt::Lit(l) => if t.first() == Some(&l.as_str()) { return Ok((Value::Str(l.clone()), 1)); },
+                Alt::Lit(l, v) if l.is_empty() => return Ok((v.clone(), 0)),
+                Alt::Lit(l, v) => if t.first() == Some(&l.as_str()) { return Ok((v.clone(), 1)); },
                 Alt::Type(ty) => if !t.is_empty() { if let Ok(r) = ty.parse(t) { return Ok(r); } },
             }
         }
@@ -271,17 +294,19 @@ impl Scalar for UnionType {
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
         for a in &self.alts {
             match a {
-                Alt::Lit(l) if l.is_empty() => if v.as_str() == Some("") { return Ok(Vec::new()); },
-                Alt::Lit(l) => if v.as_str() == Some(l.as_str()) { return Ok(vec![l.clone()]); },
+                Alt::Lit(l, lv) => if lv == v { return Ok(if l.is_empty() { Vec::new() } else { vec![l.clone()] }); },
                 Alt::Type(ty) => if let Ok(r) = ty.encode(v) { return Ok(r); },
             }
         }
-        Err(format!("{v:?} is not a valid {} ({})", self.name, self.describe_alts()))
+        Err(format!("{} is not a valid {} ({})", v.to_json(), self.name, self.describe_alts()))
     }
     fn schema(&self) -> serde_json::Value {
-        let lits: Vec<&str> = self.alts.iter().filter_map(|a| match a { Alt::Lit(l) => Some(l.as_str()), _ => None }).collect();
+        let lits: Vec<serde_json::Value> = self.alts.iter().filter_map(|a| match a { Alt::Lit(_, v) => Some(v.to_json()), _ => None }).collect();
         let mut any: Vec<serde_json::Value> = self.alts.iter().filter_map(|a| match a { Alt::Type(t) => Some(t.schema()), _ => None }).collect();
-        if !lits.is_empty() { any.push(serde_json::json!({"type": "string", "enum": lits})); }
+        if !lits.is_empty() {
+            if lits.iter().all(|l| l.is_string()) { any.push(serde_json::json!({"type": "string", "enum": lits})); }
+            else { any.push(serde_json::json!({"enum": lits})); }
+        }
         if any.len() == 1 { any.pop().unwrap() } else { serde_json::json!({"anyOf": any}) }
     }
 }
@@ -300,6 +325,9 @@ impl Scalar for StructType {
     fn name(&self) -> &str { &self.name }
     fn rest_of_line(&self) -> bool {
         matches!(self.toks.last(), Some(SToken::Field { ty, .. }) if ty.rest_of_line())
+    }
+    fn parts(&self) -> Vec<(&str, &ScalarRef)> {
+        self.toks.iter().filter_map(|t| match t { SToken::Field { name, ty } => Some((name.as_str(), ty)), _ => None }).collect()
     }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         let mut rec = crate::value::Record::new();
@@ -320,7 +348,7 @@ impl Scalar for StructType {
         Ok((Value::Record(rec), pos))
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        let rec = v.as_record().ok_or_else(|| format!("expected an object for {}, got {v:?}", self.name))?;
+        let rec = v.as_record().ok_or_else(|| format!("expected an object for {}, got {}", v.to_json(), self.name))?;
         for k in rec.keys() {
             if !self.toks.iter().any(|t| matches!(t, SToken::Field { name, .. } if name == k)) { return Err(format!("{}: unknown field `{k}`", self.name)); }
         }
@@ -354,7 +382,8 @@ impl Scalar for StructType {
 pub struct ListType { pub elem: ScalarRef }
 impl Scalar for ListType {
     fn name(&self) -> &str { "list" }
-    fn describe(&self) -> String { format!("list({})", self.elem.name()) }
+    fn describe(&self) -> String { format!("list({})", self.elem.describe()) }
+    fn elem(&self) -> Option<&ScalarRef> { Some(&self.elem) }
     fn rest_of_line(&self) -> bool { true }
     fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
         if t.is_empty() { return Err(format!("expected one or more {}", self.elem.name())); }
@@ -368,7 +397,7 @@ impl Scalar for ListType {
         Ok((Value::List(out), pos))
     }
     fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        let l = v.as_list().ok_or_else(|| format!("expected a list of {}, got {v:?}", self.elem.name()))?;
+        let l = v.as_list().ok_or_else(|| format!("expected a list of {}, got {}", v.to_json(), self.elem.name()))?;
         if l.is_empty() { return Err(format!("list of {} must not be empty", self.elem.name())); }
         let mut out = Vec::new();
         for x in l { out.extend(self.elem.encode(x)?); }

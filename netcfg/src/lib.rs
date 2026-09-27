@@ -11,6 +11,7 @@ pub mod fmt;
 pub mod lexer;
 pub mod model;
 pub mod schema;
+pub mod skeleton;
 pub mod template;
 pub mod types;
 pub mod value;
