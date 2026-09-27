@@ -183,6 +183,76 @@ impl Engine {
         self.core.explain(model).map_err(|e| PyValueError::new_err(e.0))
     }
 
+    /// Run `*.test.nct` template tests under `dir` (default: the set manifest's directory).
+    /// Returns dicts: name, source, line, ok, message.
+    #[pyo3(signature = (dir = None))]
+    fn run_tests(&self, py: Python<'_>, dir: Option<&str>) -> PyResult<Vec<PyObject>> {
+        let dir = match dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None => self.core.tests_dir().ok_or_else(|| PyValueError::new_err("no test directory: pass dir, or load a set manifest"))?,
+        };
+        let results = py.allow_threads(|| self.core.run_tests_in(&dir)).map_err(|e| PyValueError::new_err(e.0))?;
+        results.into_iter().map(|(t, r)| {
+            let d = PyDict::new_bound(py);
+            d.set_item("name", t.name)?;
+            d.set_item("source", t.source)?;
+            d.set_item("line", t.line)?;
+            d.set_item("ok", r.is_ok())?;
+            d.set_item("message", r.err())?;
+            Ok(d.into_py(py))
+        }).collect()
+    }
+
+    /// Parse every golden config under `dir` with `model` (default: the manifest's `root`).
+    /// Writes unmanaged reports to `dir/.unmanaged/`, or with `compare=True` compares with
+    /// them. Returns dicts: config, unmanaged (count or None), problem (None when fine).
+    #[pyo3(signature = (dir, model = None, compare = false))]
+    fn check_goldens(&self, py: Python<'_>, dir: &str, model: Option<&str>, compare: bool) -> PyResult<Vec<PyObject>> {
+        let model = self.core.root_model(model).map_err(|e| PyValueError::new_err(e.0))?.to_string();
+        let results = py.allow_threads(|| self.core.check_goldens(std::path::Path::new(dir), &model, compare)).map_err(|e| PyValueError::new_err(e.0))?;
+        results.into_iter().map(|c| {
+            let d = PyDict::new_bound(py);
+            d.set_item("config", c.config.display().to_string())?;
+            d.set_item("unmanaged", c.unmanaged)?;
+            d.set_item("problem", c.problem)?;
+            Ok(d.into_py(py))
+        }).collect()
+    }
+
+    /// Proposals for modelling a config's unmanaged lines. Returns dicts: path, count,
+    /// template_line, field, ignored.
+    fn suggest(&self, py: Python<'_>, model: &str, text: &str) -> PyResult<Vec<PyObject>> {
+        let s = self.core.suggest(model, text).map_err(|e| PyValueError::new_err(e.0))?;
+        s.into_iter().map(|x| {
+            let d = PyDict::new_bound(py);
+            d.set_item("path", x.path)?;
+            d.set_item("count", x.count)?;
+            d.set_item("template_line", x.template_line)?;
+            d.set_item("field", x.field)?;
+            d.set_item("ignored", x.ignored)?;
+            Ok(d.into_py(py))
+        }).collect()
+    }
+
+    /// Lint warnings as strings; with `golden` (a directory of configs), also checks against
+    /// them using `model` (default: the manifest's `root`).
+    #[pyo3(signature = (golden = None, model = None))]
+    fn lint(&self, golden: Option<&str>, model: Option<&str>) -> PyResult<Vec<String>> {
+        let goldens = match golden {
+            Some(dir) => {
+                let model = self.core.root_model(model).map_err(|e| PyValueError::new_err(e.0))?.to_string();
+                let mut configs = Vec::new();
+                for p in netcfg_core::golden::golden_files(std::path::Path::new(dir)).map_err(|e| PyValueError::new_err(e.0))? {
+                    let text = std::fs::read_to_string(&p).map_err(|e| PyValueError::new_err(format!("{}: {e}", p.display())))?;
+                    configs.push((p, text));
+                }
+                Some(netcfg_core::lint::Goldens { model, configs })
+            }
+            None => None,
+        };
+        Ok(self.core.lint(goldens.as_ref()).iter().map(|w| w.to_string()).collect())
+    }
+
     /// Example YAML for a model: every field, typed placeholders, comments from the docs.
     fn skeleton(&self, model: &str) -> PyResult<String> {
         self.core.skeleton(model).map_err(|e| PyValueError::new_err(e.0))

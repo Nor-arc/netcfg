@@ -25,6 +25,8 @@ pub(crate) enum PTok {
 
 pub struct Pattern {
     pub(crate) toks: Vec<PTok>,
+    /// Where the template line is, for messages (`template line 12`).
+    pub(crate) at: String,
 }
 
 enum PRes {
@@ -140,6 +142,12 @@ pub struct Compiled {
     ignores: Vec<Vec<String>>,
     /// Field types, for schema generation (`None` for flags and collections).
     field_types: Vec<Option<ScalarRef>>,
+    /// The file holding the model's template.
+    pub source: String,
+    /// Where the model is declared (`file:line`).
+    pub declared: String,
+    /// Every `@ignore` line of the template (at any depth), with its location.
+    pub(crate) ignore_at: Vec<(Vec<String>, String)>,
 }
 
 impl Compiled {
@@ -330,6 +338,18 @@ impl Engine {
                         Some(t) => field_types.push(Some(t)),
                         None => { errs.push(format!("field `{}`: {}", f.name, unknown_type(&catalog, &f.type_spec))); field_types.push(None); }
                     },
+                }
+            }
+            for f in &d.fields {
+                if let Some((rm, rf)) = &f.references {
+                    match index.get(rm.as_str()).map(|&i| defs[i]) {
+                        None => errs.push(format!("field `{}`: references unknown model `{rm}`", f.name)),
+                        Some(t) => match t.fields.iter().find(|g| &g.name == rf) {
+                            Some(g) if g.kind == Kind::Key => {}
+                            Some(_) => errs.push(format!("field `{}`: `{rm}.{rf}` is not a key field of {rm}; references name a key", f.name)),
+                            None => errs.push(format!("field `{}`: {rm} has no field `{rf}`", f.name)),
+                        },
+                    }
                 }
             }
             if !lines.is_empty() {
@@ -532,12 +552,12 @@ fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<V
 fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>, negation: Option<&str>) -> Result<Compiled> {
     let fields = &d.fields;
     let fidx = |n: &str| fields.iter().position(|f| f.name == n).unwrap();
-    let pattern = |toks: &[Tok]| -> Pattern {
+    let pattern = |toks: &[Tok], at: String| -> Pattern {
         Pattern { toks: toks.iter().filter_map(|t| match t {
             Tok::Lit(s) => Some(PTok::Lit(s.clone())),
             Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
             Tok::Flag(_) | Tok::Nest(_) | Tok::Include(_) => None,
-        }).collect() }
+        }).collect(), at }
     };
     let default_value = |f: &FieldDef| -> Result<Option<Value>> {
         match (&f.default, &field_types[fidx(&f.name)]) {
@@ -557,7 +577,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
                 Tok::Lit(s) => Some(PTok::Lit(s.clone())),
                 Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
                 Tok::Flag(_) | Tok::Nest(_) | Tok::Include(_) => None, // zero-width: the line's presence is the value
-            }).collect() }
+            }).collect(), at: l.at() }
         };
         let default_value = |f: &FieldDef| -> Result<Option<Value>> {
             match (&f.default, &field_types[fidx(&f.name)]) {
@@ -600,7 +620,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         Shape::Root { body, ignores } => (CShape::Root { body: not_absent(&body).iter().map(|l| slot(l, &body, 0)).collect::<Result<_>>()? }, ignores),
         Shape::Block { header, body, ignores } => (
             CShape::Block {
-                header: pattern(&header.toks),
+                header: pattern(&header.toks, header.at()),
                 key_fields: header.holes().into_iter().map(fidx).filter(|&i| fields[i].kind == Kind::Key).collect(),
                 body: not_absent(&body).iter().map(|l| slot(l, &body, 0)).collect::<Result<_>>()?,
             },
@@ -608,13 +628,21 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         ),
         Shape::Flat { lines: flat, ignores } => {
             let key_len = |l: &TLine| l.toks.iter().rposition(|t| matches!(t, Tok::Hole(n) if keys.contains(&n.as_str()))).map(|p| p + 1).unwrap_or(0);
-            let keys_pat = pattern(&flat[0].toks[..key_len(&flat[0])]);
+            let keys_pat = pattern(&flat[0].toks[..key_len(&flat[0])], flat[0].at());
             (CShape::Flat { keys: keys_pat, lines: flat.iter().map(|l| slot(l, &[], key_len(l))).collect::<Result<_>>()? }, ignores)
         }
     };
     // Defaults must parse even when the field is on a multi-value line or the header.
     for f in fields { default_value(f)?; }
-    Ok(Compiled { name: d.name.clone(), fields: fields.clone(), doc: d.doc.clone(), shape, ignores, field_types: field_types.to_vec() })
+    fn ignore_lines(ls: &[TLine], out: &mut Vec<(Vec<String>, String)>) {
+        for l in ls {
+            if l.ignore { out.push((l.lits(), l.at())); }
+            ignore_lines(&l.children, out);
+        }
+    }
+    let mut ignore_at = Vec::new();
+    ignore_lines(lines, &mut ignore_at);
+    Ok(Compiled { name: d.name.clone(), fields: fields.clone(), doc: d.doc.clone(), shape, ignores, field_types: field_types.to_vec(), source: d.template_source.clone(), declared: format!("{}:{}", d.source, d.line), ignore_at })
 }
 
 // ---- parsing --------------------------------------------------------------------------------
@@ -645,7 +673,7 @@ fn init_states(engine: &Engine, slots: &[Slot]) -> Vec<SlotState> {
     }).collect()
 }
 
-fn ignore_matches(prefix: &[String], toks: &[&str]) -> bool {
+pub(crate) fn ignore_matches(prefix: &[String], toks: &[&str]) -> bool {
     prefix.len() <= toks.len() && prefix.iter().zip(toks).all(|(p, t)| p == "*" || p == t)
 }
 
@@ -1023,10 +1051,81 @@ impl Engine {
         let mi = self.model_idx(model)?;
         let mut errs = Vec::new();
         let nodes = match value.as_record() {
-            Some(rec) => self.render_one(&self.models[mi], rec, model, mode, &mut errs),
+            Some(rec) => {
+                let nodes = self.render_one(&self.models[mi], rec, model, mode, &mut errs);
+                errs.extend(self.check_references(&self.models[mi], rec));
+                nodes
+            }
             None => { errs.push(Error(format!("{model}: expected a record, got {}", value.to_json()))); Vec::new() }
         };
         Ok((nodes, errs))
+    }
+
+    /// Visit every record of the data tree under `m`, with its data path.
+    pub(crate) fn walk_data<'a>(&'a self, m: &'a Compiled, rec: &'a Record, path: &str, f: &mut dyn FnMut(&'a Compiled, &'a Record, &str)) {
+        f(m, rec, path);
+        for fd in m.fields.iter().filter(|fd| fd.kind.is_nested()) {
+            let Some(sub) = self.models.get(&fd.type_spec) else { continue };
+            match rec.get(&fd.name) {
+                Some(Value::List(l)) => for (i, x) in l.iter().enumerate() {
+                    if let Some(r) = x.as_record() { self.walk_data(sub, r, &format!("{path}.{}[{i}]", fd.name), f); }
+                },
+                Some(Value::Record(r)) => self.walk_data(sub, r, &format!("{path}.{}", fd.name), f),
+                _ => {}
+            }
+        }
+    }
+
+    /// A field's declared default as data: a flag's `true`/`false` (false if undeclared), or a
+    /// defaulted value parsed with its type.
+    pub(crate) fn field_default(&self, m: &Compiled, i: usize) -> Option<Value> {
+        let f = &m.fields[i];
+        if f.kind == Kind::Flag { return Some(Value::Bool(f.default.as_ref().map(|d| d[0] == "true").unwrap_or(false))); }
+        let d = f.default.as_ref()?;
+        let toks: Vec<&str> = d.iter().map(String::as_str).collect();
+        m.field_type(i)?.parse(&toks).ok().map(|(v, _)| v)
+    }
+
+    /// Models reachable from `m` through nested fields (including `m`).
+    pub(crate) fn reachable<'a>(&'a self, m: &'a Compiled) -> Vec<&'a str> {
+        let mut out: Vec<&str> = vec![m.name.as_str()];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = &self.models[out[i]];
+            for fd in cur.fields.iter().filter(|fd| fd.kind.is_nested()) {
+                if !out.contains(&fd.type_spec.as_str()) { out.push(fd.type_spec.as_str()); }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// `references Model.field`: every such value must be a key value of a `Model` record in
+    /// the same data tree. References to models the tree cannot contain are not checked.
+    fn check_references(&self, root: &Compiled, rec: &Record) -> Vec<Error> {
+        let reachable = self.reachable(root);
+        let wanted: Vec<(&str, &str)> = reachable.iter().flat_map(|n| self.models[*n].fields.iter())
+            .filter_map(|f| f.references.as_ref().map(|(m, k)| (m.as_str(), k.as_str())))
+            .filter(|(m, _)| reachable.contains(m)).collect();
+        if wanted.is_empty() { return Vec::new(); }
+        let mut known: IndexMap<(&str, &str), Vec<&Value>> = wanted.iter().map(|w| (*w, Vec::new())).collect();
+        self.walk_data(root, rec, &root.name, &mut |m, r, _| {
+            for ((tm, tf), vals) in known.iter_mut() {
+                if m.name == *tm { if let Some(v) = r.get(*tf) { vals.push(v); } }
+            }
+        });
+        let mut errs = Vec::new();
+        self.walk_data(root, rec, &root.name, &mut |m, r, path| {
+            for f in &m.fields {
+                let Some((tm, tf)) = &f.references else { continue };
+                let (Some(vals), Some(v)) = (known.get(&(tm.as_str(), tf.as_str())), r.get(&f.name)) else { continue };
+                if v.is_null() || vals.contains(&v) { continue; }
+                let mut names: Vec<String> = vals.iter().map(|v| fmt_value(v)).collect();
+                names.dedup();
+                errs.push(Error(format!("{path}: field `{}`: {} is not a {tm}.{tf} in this data (known: {})", f.name, v.to_json(), if names.is_empty() { "none".to_string() } else { names.join(", ") })));
+            }
+        });
+        errs
     }
 
     /// Render one record of `m`. `path` locates it in the data (`Device.bgp[0]`); problems are

@@ -1,0 +1,54 @@
+# Template tests for the IOS set: `netcfg test templates/ios`.
+
+test "interfaces with masked addresses"
+  model: Device
+  config:
+    hostname sw1
+    !
+    interface Gi0/1
+     description uplink to core
+     ip address 10.0.0.1 255.255.255.0
+     ip address 10.0.1.1 255.255.255.0 secondary
+     mtu 9000
+     shutdown
+    !
+    end
+  expect:
+    hostname: sw1
+    vlans: []
+    interfaces:
+      - {name: Gi0/1, description: uplink to core, address: 10.0.0.1/24, mtu: 9000, shutdown: true}
+    routes: []
+    acls: []
+  unmanaged:
+    - interface Gi0/1 > ip address 10.0.1.1 255.255.255.0 secondary
+  roundtrip: true
+
+test "mtu is range-checked"
+  model: Interface
+  config:
+    interface Gi0/1
+     mtu 99999
+  fails: 99999 is outside 576..9216
+
+test "a trailing word makes a line unrepresentable"
+  model: Interface
+  config:
+    interface Gi0/1
+     mtu 1500 bytes
+  fails: starts like a managed line
+
+test "ACL entries are positional"
+  model: Acl
+  config:
+    ip access-list extended EDGE
+     permit tcp any any eq 443
+     deny ip any any
+     permit tcp any any eq 443
+  expect:
+    name: EDGE
+    entries:
+      - {action: permit, match: tcp any any eq 443}
+      - {action: deny, match: ip any any}
+      - {action: permit, match: tcp any any eq 443}
+  roundtrip: true

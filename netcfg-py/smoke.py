@@ -72,4 +72,14 @@ assert cs.ops == [{"op": "set", "path": [], "line": "hostname leaf2", "was": "ho
 assert e.diff("Device", r.value, r.value).empty
 assert "    no shutdown\n" in e.render("Device", r.value, explicit=True)
 
+# Authoring tools.
+results = e.run_tests()
+assert results and all(t["ok"] for t in results), results
+checked = e.check_goldens(str(T / "nxos" / "golden"), compare=True)
+assert checked and all(c["problem"] is None for c in checked), checked
+sug = e.suggest("Device", (T / "nxos" / "golden" / "leaf1.cfg").read_text())
+assert {"path": "router bgp 65000 > neighbor * > bfd", "count": 2, "template_line": "bfd [[ bfd ]]", "field": "bfd: flag", "ignored": False} in sug, sug
+assert e.lint() == []
+assert any("never set in the goldens" in w for w in e.lint(golden=str(T / "nxos" / "golden")))
+
 print("ok")

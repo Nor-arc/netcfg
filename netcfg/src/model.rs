@@ -60,6 +60,8 @@ pub struct FieldDef {
     pub doc: Option<String>,
     /// `[Model] ordered`: a positional collection (identity is position, not key).
     pub ordered: bool,
+    /// `... references Model.field`: the value must be a key value of `Model` in the data.
+    pub references: Option<(String, String)>,
     pub line: usize,
 }
 
@@ -407,6 +409,13 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
     let (name, spec) = t.split_once(':').ok_or_else(|| Error(format!("expected `name: type`, got `{t}`")))?;
     let name = name.trim();
     if !is_ident(name) { return Err(Error(format!("`{name}` is not a valid field name"))); }
+    let (spec, references) = match spec.rsplit_once(" references ") {
+        Some((s, r)) => match r.trim().split_once('.') {
+            Some((m, f)) if is_ident(m) && is_ident(f) => (s, Some((m.to_string(), f.to_string()))),
+            _ => return Err(Error(format!("field `{name}`: `references {}` must name a model and its key field: `references Model.field`", r.trim()))),
+        },
+        None => (spec, None),
+    };
     let (spec, default) = if spec.contains("{{") { (spec.trim(), None) } else { match spec.split_once('=') {
         Some((s, d)) => (s.trim(), Some(d.split_ascii_whitespace().map(String::from).collect::<Vec<_>>())),
         None => (spec.trim(), None),
@@ -445,7 +454,10 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
         return Err(Error(format!("field `{name}`: only required values and flags can have a default")));
     }
     if type_spec.is_empty() { return Err(Error(format!("field `{name}`: missing type"))); }
-    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, doc, ordered, line: ln })
+    if references.is_some() && !matches!(kind, Kind::Scalar | Kind::Opt) {
+        return Err(Error(format!("field `{name}`: only optional or required value fields can reference another model")));
+    }
+    Ok(FieldDef { name: name.to_string(), kind, type_spec, default, doc, ordered, references, line: ln })
 }
 
 #[cfg(test)]

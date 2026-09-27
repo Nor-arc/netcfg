@@ -8,13 +8,17 @@
 pub mod dialect;
 pub mod diff;
 pub mod engine;
+pub mod golden;
 pub mod fmt;
 pub mod lexer;
+pub mod lint;
 pub mod model;
 pub mod schema;
 pub mod set;
 pub mod skeleton;
+pub mod suggest;
 pub mod template;
+pub mod testfile;
 pub mod types;
 pub mod value;
 

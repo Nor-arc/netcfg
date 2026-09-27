@@ -1,0 +1,44 @@
+# Template tests for the Junos set: `netcfg test templates/junos`.
+
+test "values at any depth inside containers"
+  model: JunosDevice
+  config:
+    system {
+        host-name r1;
+        services {
+            ssh;
+            netconf {
+                ssh;
+            }
+        }
+    }
+    interfaces {
+        ge-0/0/0 {
+            description "to core";
+            unit 0 {
+                family inet {
+                    address 10.0.0.1/24;
+                }
+            }
+        }
+    }
+  expect:
+    hostname: r1
+    sshEnabled: true
+    interfaces: [{name: ge-0/0/0, description: to core, address: 10.0.0.1/24}]
+    groups: []
+  unmanaged:
+    - system > services > netconf > ssh
+  roundtrip: true
+
+test "strict inside containers"
+  model: JunosDevice
+  config:
+    protocols {
+        bgp {
+            group EXT {
+                type weird;
+            }
+        }
+    }
+  fails: not a valid peerType

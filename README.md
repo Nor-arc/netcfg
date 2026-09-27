@@ -65,6 +65,7 @@ Templates use three placeholder markers, one per kind of field:
 | `f: T` | Required value. May also appear on the header line (`route-map {{ name }} {{ action }} {{ seq }}`). |
 | `f: T = default` | Required, with a default used when the line is absent; the line is omitted when rendering the default. |
 | `f: T?` | The line is optional. |
+| `f: T? references Model.key` | A cross-field reference: the value must be a `key` value of some `Model` record in the same data tree (`routeMapIn: string? references RouteMapEntry.name`). Checked by `validate-data`, `render` and `diff`, not by `parse` (devices accept dangling references) and not in the JSON Schema. Data that cannot contain `Model` is not checked. |
 | `f: flag` / `f: flag = true` (written `[[ f ]]` in the template) | Presence of a literal line; `<negation> <line>` is `false`. Set the default to the device's default so negated lines render exactly when needed. A flag whose template literals start with the negation word (`no ip address {{ cleared }}`) is matched literally and only has that spelling. |
 | `f: [Model]` | A keyed collection; `<< f >>` alone on a line stands for all of its blocks/lines. |
 | `f: [Model] ordered` | A positional collection: elements are identified by position, not key. Every matching block/line is an element, in config order; rendering follows data order; duplicates are allowed. The element model may have no key (then its template must have exactly one top-level line, like an ACL entry `{{ action }} {{ match }}`). Flat groups can't be positional. |
@@ -271,10 +272,99 @@ Parse results carry `engine_version` and `templates_version` (the set manifest's
 data with the same provenance in a leading comment. `render`, `validate-data` and `diff`
 accept either the envelope or plain data.
 
+## Authoring tools
+
+### `netcfg test`: template tests
+
+Tests live next to the templates in `*.test.nct` files (never loaded as templates):
+
+```text
+test "neighbor with maximum-routes"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 remote-as 65431
+    neighbor 1.1.1.1 maximum-routes 1200 warning-only
+  expect:
+    peer: 1.1.1.1
+    remoteAs: 65431
+    maximumRoutes: {limit: 1200, action: warning-only}
+  roundtrip: true
+
+test "unknown modifier fails"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 maximum-routes 1200 loudly
+  fails: starts like a managed line
+
+test "password is ignored"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 remote-as 1
+    neighbor 1.1.1.1 password 7 abc
+  unmanaged:
+    - neighbor 1.1.1.1 password 7 abc
+```
+
+`expect` is YAML compared exactly in canonical form: flags and defaulted fields at their
+defaults and empty collections may be left out (canonical rendering writes nothing for them),
+but every other key must match and missing keys must be missing. `unmanaged` is the exact
+list of unmanaged paths; `roundtrip: true` renders the parse and parses it again; `render:`
+is the exact canonical rendering; `fails:` requires a parse error containing the text. A block
+property is written `key:` or `key: |` with the block indented under it. `netcfg test
+templates/eos` (or `--set`) prints pass/fail per test and exits non-zero on failure. Each
+example set has a test file porting part of the Rust edge-case suite.
+
+### `netcfg check`: golden configs as a CI gate
+
+```
+netcfg check --set templates/nxos/set.nct --golden templates/nxos/golden            # write reports
+netcfg check --set templates/nxos/set.nct --golden templates/nxos/golden --compare  # CI
+```
+
+Every file under the golden directory (except dot-files) is parsed with the set's device model
+(the manifest's `root`, or `--model`); a strict error fails the check. Each config's unmanaged
+report is written to `golden/.unmanaged/<config>.txt`; with `--compare` the reports are
+compared with the committed ones instead, and any difference (`- removed`, `+ added`) fails.
+Commit the reports; a template change that changes what is managed then shows up in review.
+
+### `netcfg suggest`: from unmanaged lines to template lines
+
+```
+$ netcfg suggest templates/nxos templates/nxos/golden/leaf1.cfg --model Device
+router bgp 65000 > neighbor * > bfd           (2x)  bfd [[ bfd ]]                 bfd: flag
+router bgp 65000 > neighbor * > password 3 *  (2x)  password 3 {{ password }}     password: string?
+feature bgp                                   (1x)  feature bgp [[ featureBgp ]]  featureBgp: flag
+version *                                     (1x)  version {{ version }}         version: string?
+```
+
+Unmanaged leaf lines are grouped under their ancestors (tokens that vary between sibling
+ancestors become `*`) by literal prefix, the tokens up to the first one that varies. A
+constant line proposes a flag; one varying trailing token proposes `string?` (`int?`,
+`ipv4?`, `ipv6?` when every value is one); several propose `phrase?`. A varying token followed
+by repeated keywords is taken as a key (`neighbor {{ key }} bfd` for EOS flat groups).
+Groups an `@ignore` already covers are marked. These are heuristics; nothing is edited.
+
+### `netcfg lint`
+
+Warnings (exit status 0 unless `--strict`):
+
+- a template line **shadowed** by an earlier line with the same literal prefix that claims or
+  rejects every such line (`hops {{ a }}` before `hops {{ b }}`);
+- **ambiguous claims**: nested models (or a nested model and a line) at the same level whose
+  entry lines share a literal prefix;
+- with `--golden dir`: models that never appear, value fields never set, flags that are always
+  at their declared default (is it the device's default? is the flag needed?), and `@ignore`
+  prefixes that match no line.
+
+Library: `Engine::run_tests_in`, `check_goldens`, `suggest`, `lint`; Python:
+`Engine.run_tests()`, `check_goldens(dir, compare=...)`, `suggest(model, text)`,
+`lint(golden=...)`.
+
 ## Data validation
 
 `render` and `validate-data` apply the same checks to data: unknown fields, wrong types,
-missing required fields, struct shapes, and duplicate keys within a collection. Every message
+missing required fields, struct shapes, duplicate keys within a collection, and cross-field
+references. Every message
 carries the data path (`Device.bgp[0].neighbors[1]: field `remoteAs`: "x" is not an AS
 number`). `render` stops at the first problem; `validate-data` (and
 `Engine::validate_data`) reports all of them. Since 0.4 `render` rejects unknown fields
@@ -304,6 +394,10 @@ netcfg skeleton templates/nxos --model Device       # example YAML: every field,
 netcfg validate-data templates/nxos intent.yaml --model Device   # check data without rendering; every error
 netcfg bench   templates/nxos running.cfg --model Device --runs 5
 netcfg fmt     templates/                           # named templates, each after its model (--check, --keep-order)
+netcfg test    templates/eos                        # run *.test.nct template tests
+netcfg check   --set templates/nxos/set.nct --golden templates/nxos/golden --compare
+netcfg suggest templates/nxos running.cfg --model Device
+netcfg lint    templates/nxos --golden templates/nxos/golden
 ```
 `--dialect NAME` selects a builtin when the templates don't declare one.
 ```
@@ -333,10 +427,12 @@ The GIL is released during `parse` and `render`, so a thread pool parallelises a
 
 ## Tests and equivalence
 
-- `cargo test`: unit tests plus the edge-case suite (must-fail, must-be-unmanaged, invariants, must-parse-to) ported from the Scala harness, over NX-OS blocks, EOS flat groups, `@ignore`, and template validation.
-- Cross-check against the Scala engine: on generated 20k-neighbor NX-OS (297k lines) and EOS (228k lines) configs with injected noise, the Rust engine's canonical render of its parse is **byte-identical** to the Scala engine's, and the unmanaged reports are identical (24,849 and 34,759 paths).
+- `cargo test`: unit tests plus the edge-case suite (must-fail, must-be-unmanaged, invariants, must-parse-to) ported from the Scala harness, over NX-OS blocks, EOS flat groups, `@ignore`, and template validation; and one suite per feature area: `nct_format.rs` (file format, named templates, `<< >>`, singletons), `declarations.rs` (docs, comments, mapped enums, fragments, skeleton, validate-data), `collections.rs`, `sets.rs`, `diff.rs` (change sets are applied to rendered configs and re-parsed), `authoring.rs` (test/check/suggest/lint/references).
+- `netcfg test templates/<set>` runs each example set's `*.test.nct` file; `netcfg check --compare` keeps the NX-OS golden report in sync.
+- `python netcfg-py/smoke.py` against the installed wheel.
+- Cross-check against the Scala engine (measured on 0.3, before the 0.4 format changes): on generated 20k-neighbor NX-OS (297k lines) and EOS (228k lines) configs with injected noise, the Rust engine's canonical render of its parse is **byte-identical** to the Scala engine's, and the unmanaged reports are identical (24,849 and 34,759 paths).
 
-## Performance (1 vCPU sandbox, `--release`, median of 5)
+## Performance (0.3; 1 vCPU sandbox, `--release`, median of 5)
 
 | config | lines | lex | match | parse total | render |
 |---|---:|---:|---:|---:|---:|
@@ -359,9 +455,14 @@ netcfg/src/schema.rs     JSON Schema from model declarations
 netcfg/src/skeleton.rs   example YAML for a model
 netcfg/src/set.rs        set manifests: files, includes, version, load_set / load_all
 netcfg/src/diff.rs       change sets: running data -> intent data as config commands
+netcfg/src/testfile.rs   `netcfg test`: *.test.nct parser and runner
+netcfg/src/golden.rs     `netcfg check`: golden configs and unmanaged reports
+netcfg/src/suggest.rs    `netcfg suggest`: template lines for unmanaged lines
+netcfg/src/lint.rs       `netcfg lint`
 netcfg/src/main.rs       CLI
 netcfg-py/               PyO3 bindings (maturin)
-templates/{ios,nxos,eos,junos} example sets (each with a set.nct manifest)
+templates/{ios,nxos,eos,junos} example sets (each with a set.nct manifest and *.test.nct tests;
+                         templates/nxos/golden/ holds a golden config and its report)
 templates/common/        files shared between sets through `include`
 docs/                    design notes
 ```

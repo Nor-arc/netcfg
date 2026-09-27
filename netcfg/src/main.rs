@@ -102,6 +102,43 @@ enum Cmd {
         /// Don't write; exit non-zero if any file would change.
         #[arg(long)] check: bool,
     },
+    /// Run the set's template tests (`*.test.nct` next to the templates); exit non-zero on
+    /// failure.
+    Test {
+        #[arg(value_name = "TEMPLATES")] paths: Vec<PathBuf>,
+        #[command(flatten)] src: Src,
+    },
+    /// Parse every golden config under a directory with the set's device model; fail on strict
+    /// errors and write each unmanaged report to DIR/.unmanaged/<config>.txt. With --compare,
+    /// compare against the committed reports instead (the CI gate).
+    Check {
+        #[arg(value_name = "TEMPLATES")] paths: Vec<PathBuf>,
+        /// Directory of golden configs.
+        #[arg(long)] golden: PathBuf,
+        /// Device model (default: the manifest's `root`).
+        #[arg(long)] model: Option<String>,
+        /// Compare with the committed reports instead of writing them.
+        #[arg(long)] compare: bool,
+        #[command(flatten)] src: Src,
+    },
+    /// Propose template lines and fields for a config's unmanaged lines.
+    Suggest {
+        #[arg(value_name = "[TEMPLATES] CONFIG", num_args = 1..=2, required = true)] paths: Vec<PathBuf>,
+        #[arg(long)] model: String,
+        #[command(flatten)] src: Src,
+    },
+    /// Warn about shadowed template lines and ambiguous claims; with --golden, also about
+    /// unused fields, flags always at their default and @ignore lines that match nothing.
+    Lint {
+        #[arg(value_name = "TEMPLATES")] paths: Vec<PathBuf>,
+        /// Directory of golden configs.
+        #[arg(long)] golden: Option<PathBuf>,
+        /// Device model for the goldens (default: the manifest's `root`).
+        #[arg(long)] model: Option<String>,
+        /// Exit non-zero if there are warnings.
+        #[arg(long)] strict: bool,
+        #[command(flatten)] src: Src,
+    },
     /// Time parse and render on a config.
     Bench {
         #[arg(value_name = "[TEMPLATES] CONFIG", num_args = 1..=2, required = true)] paths: Vec<PathBuf>,
@@ -288,6 +325,65 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             for c in &changed { println!("{} {c}", if check { "would reformat" } else { "reformatted" }); }
             if check && !changed.is_empty() { return Err(format!("{} file(s) need formatting", changed.len())); }
+            Ok(())
+        }
+        Cmd::Test { paths, src } => {
+            let (e, _) = load(&src, &paths, &[])?;
+            let dir = match (&src.set, paths.first()) {
+                (_, Some(p)) if p.is_dir() => p.clone(),
+                _ => e.tests_dir().ok_or("no test directory: name a set manifest or a directory")?,
+            };
+            let results = e.run_tests_in(&dir).map_err(|e| e.0)?;
+            let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+            for (t, r) in &results {
+                let at = format!("{}:{}", t.source, t.line);
+                match r {
+                    Ok(()) => println!("ok    {at} {}", t.name),
+                    Err(msg) => println!("FAIL  {at} {}
+      {}", t.name, msg.replace('\n', "\n      ")),
+                }
+            }
+            println!("{} passed, {failed} failed", results.len() - failed);
+            if results.is_empty() { println!("(no *.test.nct files under {})", dir.display()); }
+            if failed > 0 { return Err(format!("{failed} test(s) failed")); }
+            Ok(())
+        }
+        Cmd::Check { paths, golden, model, compare, src } => {
+            let (e, _) = load(&src, &paths, &[])?;
+            let model = e.root_model(model.as_deref()).map_err(|e| e.0)?.to_string();
+            let results = e.check_goldens(&golden, &model, compare).map_err(|e| e.0)?;
+            let failed = results.iter().filter(|r| r.problem.is_some()).count();
+            for r in &results {
+                match (&r.problem, r.unmanaged) {
+                    (None, Some(n)) => println!("ok    {} ({n} unmanaged)", r.config.display()),
+                    (Some(p), _) => println!("FAIL  {}\n      {}", r.config.display(), p.replace('\n', "\n      ")),
+                    (None, None) => unreachable!(),
+                }
+            }
+            println!("{} config(s), {failed} failed{}", results.len(), if compare { "" } else { "; reports written to .unmanaged/" });
+            if failed > 0 { return Err(format!("{failed} golden config(s) failed")); }
+            Ok(())
+        }
+        Cmd::Suggest { paths, model, src } => {
+            let (e, rest) = load(&src, &paths, &["CONFIG"])?;
+            print!("{}", netcfg::suggest::format(&e.suggest(&model, &read_text(&rest[0])?).map_err(|e| e.0)?));
+            Ok(())
+        }
+        Cmd::Lint { paths, golden, model, strict, src } => {
+            let (e, _) = load(&src, &paths, &[])?;
+            let goldens = match &golden {
+                Some(dir) => {
+                    let model = e.root_model(model.as_deref()).map_err(|e| e.0)?.to_string();
+                    let configs = netcfg::golden::golden_files(dir).map_err(|e| e.0)?.into_iter()
+                        .map(|p| read_text(&p).map(|t| (p, t))).collect::<Result<Vec<_>, _>>()?;
+                    Some(netcfg::lint::Goldens { model, configs })
+                }
+                None => None,
+            };
+            let warnings = e.lint(goldens.as_ref());
+            for w in &warnings { println!("warning: {w}"); }
+            println!("{} warning(s)", warnings.len());
+            if strict && !warnings.is_empty() { return Err(format!("{} lint warning(s) (--strict)", warnings.len())); }
             Ok(())
         }
         Cmd::Bench { paths, model, runs, src } => {
