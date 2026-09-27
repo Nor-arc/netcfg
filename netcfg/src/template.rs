@@ -128,6 +128,13 @@ pub fn shape(lines: &[TLine], keys: &[&str]) -> Result<Shape, String> {
     }
 }
 
+/// A constant line: a leaf with no placeholders except (in a flat group) the key ones. It must
+/// be present, produces no data, and is always rendered.
+pub fn is_constant(l: &TLine, keys: &[&str]) -> bool {
+    !l.ignore && l.children.is_empty() && l.holes().iter().all(|h| keys.contains(h))
+        && l.toks.iter().all(|t| matches!(t, Tok::Lit(_) | Tok::Hole(_)))
+}
+
 /// `rest_of_line(type_spec)` tells whether a field's type consumes the rest of the line.
 /// A line that spells the *absence* of an optional field: `<negation> <literals> {{ field }}`
 /// where the same field is also bound by a normal value line. Its placeholder is the
@@ -223,7 +230,8 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     }
     let check_value_line = |errs: &mut Vec<String>, l: &TLine, allow_keys: bool| {
         let metas: Vec<&FieldDef> = l.holes().into_iter().filter_map(by_name).collect();
-        if l.holes().is_empty() { err(errs, l, "line binds no field".into()); }
+        // Nothing but literals (and, in a flat group, the key): a constant line.
+        if is_constant(l, &keys) && (allow_keys || l.holes().is_empty()) { return; }
         if !l.children.is_empty() { err(errs, l, "a line with placeholders cannot have nested lines; model the block as its own keyed type".into()); }
         if !allow_keys {
             for k in l.holes() { if keys.contains(&k) { err(errs, l, format!("Key field `{k}` belongs on the header line")); } }
@@ -279,6 +287,10 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
         Ok(Shape::Flat { lines: flat, .. }) => {
             for l in &flat {
                 if absent_spelling_of(l, negation, fields).is_some() || negated_flag_line(l, negation, fields).is_some() { err(&mut errs, l, "negated spellings are not supported in flat groups yet".into()); continue; }
+                if is_constant(l, &keys) && negation.is_some() && l.toks.first() == negation.map(|n| Tok::Lit(n.to_string())).as_ref() {
+                    err(&mut errs, l, "a constant line in a flat group cannot start with the negation word; write it in a block body, or model it as a flag".into());
+                    continue;
+                }
                 let ks: Vec<&str> = l.holes().into_iter().filter(|h| keys.contains(h)).collect();
                 if ks != keys { err(&mut errs, l, format!("every line of a flat group must carry all Key fields in the same order ({})", keys.join(", "))); }
                 let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) | Tok::Flag(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));

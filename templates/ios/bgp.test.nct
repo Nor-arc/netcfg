@@ -1,0 +1,44 @@
+# Constant lines: `neighbor X activate` must be present for every neighbor of a family.
+
+test "constant line present"
+  model: IosBgp
+  config:
+    router bgp 65000
+     bgp router-id 10.0.0.1
+     neighbor 10.1.0.1 remote-as 65001
+     !
+     address-family ipv4
+      neighbor 10.1.0.1 activate
+      neighbor 10.1.0.1 route-map RM-IN in
+     exit-address-family
+  expect:
+    asn: 65000
+    routerId: 10.0.0.1
+    neighbors: [{peer: 10.1.0.1, remoteAs: 65001}]
+    families: [{afi: ipv4, neighbors: [{peer: 10.1.0.1, routeMapIn: RM-IN}]}]
+  unmanaged:
+    - router bgp 65000 > exit-address-family
+  render: |
+    router bgp 65000
+     bgp router-id 10.0.0.1
+     neighbor 10.1.0.1 remote-as 65001
+     address-family ipv4
+      neighbor 10.1.0.1 activate
+      neighbor 10.1.0.1 route-map RM-IN in
+    !
+    end
+
+test "constant line missing"
+  model: IosAf
+  config:
+    address-family ipv4
+     neighbor 10.1.0.1 route-map RM-IN in
+  fails: IosAfNeighbor 10.1.0.1: constant line `neighbor {{ peer }} activate` is missing (if this line is optional, declare a flag and write `neighbor {{ peer }} activate [[ name ]]`)
+
+test "constant line twice"
+  model: IosAf
+  config:
+    address-family ipv4
+     neighbor 10.1.0.1 activate
+     neighbor 10.1.0.1 activate
+  fails: matched twice

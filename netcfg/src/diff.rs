@@ -324,6 +324,8 @@ impl Engine {
                         },
                     }
                 }
+                // Written with an added block, never changed or deleted on its own.
+                Slot::Const { .. } => {}
                 Slot::Container { lits, body, .. } => {
                     let children = self.diff_body(m, body, r, i, opts)?;
                     if !children.is_empty() {

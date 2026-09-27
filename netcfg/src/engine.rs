@@ -111,6 +111,9 @@ pub(crate) enum Mode {
 pub(crate) enum Slot {
     Line { pat: Pattern, mode: Mode },
     Flag { lits: Pattern, field: usize, default: bool },
+    /// A line of literals only (plus the key in a flat group): must be present, carries no
+    /// data, always rendered. `text` is the template line as written, for messages.
+    Const { lits: Pattern, text: String },
     /// `<< field >>`: blocks/groups of a nested model.
     Nested { field: usize, model: usize, card: Card },
     /// A literal-only line with nested lines (`protocols {`, `bgp {`): its children are
@@ -139,7 +142,7 @@ pub struct Compiled {
     pub doc: Option<String>,
     pub(crate) shape: CShape,
     /// `@ignore` prefixes: for blocks/roots they apply to the body; for flat groups to the parent level.
-    ignores: Vec<Vec<String>>,
+    pub(crate) ignores: Vec<Vec<String>>,
     /// Field types, for schema generation (`None` for flags and collections).
     field_types: Vec<Option<ScalarRef>>,
     /// The file holding the model's template.
@@ -386,7 +389,10 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        Ok(Engine { dialect, catalog, models, warnings, templates_version: None, set: None })
+        let mut e = Engine { dialect, catalog, models, warnings, templates_version: None, set: None };
+        let ignored = e.ignored_constants();
+        e.warnings.extend(ignored.iter().map(|w| w.to_string()));
+        Ok(e)
     }
 
     /// Load a directory as a set. If it holds a set manifest, that manifest defines the set
@@ -610,6 +616,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             }),
             [f] if f.kind == Kind::Opt => Ok(Slot::Line { pat: pattern(toks), mode: Mode::Opt }),
             [f] if f.default.is_some() => Ok(Slot::Line { pat: pattern(toks), mode: Mode::Default(default_value(f)?.unwrap()) }),
+            [] if l.children.is_empty() => Ok(Slot::Const { lits: pattern(toks), text: l.text() }),
             _ => Ok(Slot::Line { pat: pattern(toks), mode: Mode::Required }),
         }
     }
@@ -650,6 +657,8 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
 enum SlotState {
     Line(Option<Vec<(usize, Value)>>),
     Flag(Option<bool>),
+    /// A constant line: seen yet?
+    Const(bool),
     Container(Option<Vec<SlotState>>),
     Block { items: Vec<Record>, keys: HashSet<Vec<Value>> },
     /// An unkeyed model used as a singleton: its body's states, and whether its line was seen.
@@ -663,6 +672,7 @@ fn init_states(engine: &Engine, slots: &[Slot]) -> Vec<SlotState> {
     slots.iter().map(|s| match s {
         Slot::Line { .. } => SlotState::Line(None),
         Slot::Flag { .. } => SlotState::Flag(None),
+        Slot::Const { .. } => SlotState::Const(false),
         Slot::Nested { model, .. } => match &engine.models[*model].shape {
             CShape::Flat { .. } => SlotState::Flat { groups: IndexMap::new() },
             CShape::Block { .. } => SlotState::Block { items: Vec::new(), keys: HashSet::new() },
@@ -788,6 +798,16 @@ impl Engine {
                 }
                 _ => Claim::NotMine,
             },
+            (Slot::Const { lits, .. }, SlotState::Const(seen)) => match lits.parse_full(&n.tokens) {
+                // Matched literally, the negation word included if the template has it.
+                PRes::Ok(..) => {
+                    if *seen { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
+                    *seen = true;
+                    remnant(n, unmanaged);
+                    Claim::Claimed
+                }
+                _ => Claim::NotMine,
+            },
             (Slot::Flag { lits, .. }, SlotState::Flag(st)) => {
                 // A flag written with the negation word in the template (`no ip address`) is
                 // matched literally: its only spelling is the negated one.
@@ -889,6 +909,9 @@ impl Engine {
                         Slot::Flag { lits, .. } => {
                             if let PRes::Ok(..) = lits.parse_full(rest) { hit = Some((i, None)); break; }
                         }
+                        Slot::Const { lits, .. } => {
+                            if !negated { if let PRes::Ok(..) = lits.parse_full(rest) { hit = Some((i, None)); break; } }
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -902,6 +925,10 @@ impl Engine {
                     (SlotState::Line(st), Some(vals)) => {
                         if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
                         *st = Some(vals);
+                    }
+                    (SlotState::Const(seen), None) => {
+                        if *seen { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
+                        *seen = true;
                     }
                     (SlotState::Flag(st), None) => {
                         if st.is_some() { return Claim::Failed(format!("`{}`: matched twice", n.line_text())); }
@@ -924,6 +951,13 @@ impl Engine {
             }
             Slot::Flag { lits, .. } => if self.literal_no(lits) { lits.collides(&n.tokens) } else { lits.collides(self.strip_no(&n.tokens).0) },
             Slot::Container { lits, .. } => lits.collides(&n.tokens),
+            Slot::Const { lits, .. } => {
+                // With extra tokens, negated when the constant isn't, or the positive form of a
+                // negated constant: all start like it, and none is it.
+                let l = lits.literal_prefix();
+                let (stripped, negated) = self.strip_no(&n.tokens);
+                n.tokens.starts_with(&l) || (negated && stripped.starts_with(&l)) || (self.literal_no(lits) && n.tokens.starts_with(&l[1..]))
+            }
             Slot::Nested { model, .. } => match &self.models[*model].shape {
                 CShape::Root { body } => self.collides(&body[0], n),
                 CShape::Flat { keys, lines } => {
@@ -932,6 +966,7 @@ impl Engine {
                         PRes::Ok(_, used) => lines.iter().any(|l| match l {
                             Slot::Line { pat, .. } => pat.collides(&toks[used..]) || (pat.has_holes() && toks[used..].starts_with(pat.literal_prefix().as_slice())),
                             Slot::Flag { lits, .. } => lits.collides(&toks[used..]),
+                            Slot::Const { lits, .. } => toks[used..].starts_with(&lits.literal_prefix()),
                             _ => false,
                         }),
                         _ => false,
@@ -963,6 +998,11 @@ impl Engine {
                     Mode::Opt => {}
                     Mode::Default(d) => { let PTok::Hole { field, .. } = pat.toks.iter().find(|t| matches!(t, PTok::Hole { .. })).unwrap() else { unreachable!() }; vals[*field] = Some(d.clone()); }
                 },
+                (Slot::Const { text, .. }, st) => {
+                    if !matches!(st, Some(SlotState::Const(true))) {
+                        return Err(Error(format!("constant line `{text}` is missing (if this line is optional, declare a flag and write `{text} [[ name ]]`)")));
+                    }
+                }
                 (Slot::Flag { field, default, .. }, st) => {
                     let b = match st { Some(SlotState::Flag(Some(b))) => b, _ => *default };
                     vals[*field] = Some(Value::Bool(b));
@@ -1221,6 +1261,7 @@ impl Engine {
                     }
                     out.push(OwnedNode::leaf(toks));
                 }
+                Slot::Const { lits, .. } => out.push(OwnedNode::leaf(lits.literal_prefix().iter().map(|s| s.to_string()).collect())),
                 Slot::Container { lits, body, .. } => {
                     let children = self.render_body(m, body, rec, path, mode, errs);
                     if !children.is_empty() {
@@ -1384,6 +1425,9 @@ impl Engine {
                         doc_line(&m.fields[*field], out);
                         out.push_str(&format!("  value    → {prefix}one {} block/group (a second is an error)\n", sub.name));
                         if !*required { out.push_str("  missing  → (nothing written)\n"); }
+                    }
+                    Slot::Const { lits, .. } => {
+                        out.push_str(&format!("(constant)\n  always   → {prefix}{}\n", show(lits)));
                     }
                     Slot::Container { lits, body, .. } => {
                         walk(e, m, body, &format!("{prefix}{} > ", show(lits)), show, neg, out);

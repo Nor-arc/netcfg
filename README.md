@@ -78,6 +78,7 @@ Templates use three placeholder markers, one per kind of field:
 | `type name = {{ limit: int }} {{ action: "warning-only" \| "" }}` | Struct type: a value's own little template. Data is a record (`{limit: 1200, action: warning-only}`); sub-fields whose type allows `""` may sit anywhere and are omitted when absent. Placeholders may use inline unions. |
 | `f: {{ limit: int }} {{ action: "warning-only" \| "" }}?` | Anonymous struct on a field, for one-off shapes; `type` is for reused ones. |
 | `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. Inside a struct type, a list stops before a literal that can follow it: in `{{ names: list(string) }} {{ exact: "exact-match" \| "" }}`, `A B exact-match` is `names: [A, B], exact: exact-match`. A token that could be either an element or that literal is taken as the literal. |
+| constant line (`exit-address-family`, `neighbor {{ peer }} activate`) | A line with no placeholders (in a flat group: only the key ones) and no nested lines. It must be present, carries no data, and is always rendered in template position. A literal-only line *with* nested lines is a container, as before. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
 | `fragment Name` + `<< @Name >>` | A reusable run of body lines with its own fields and no identity (see below). |
 
@@ -373,6 +374,20 @@ instead of ignoring them.
 ## Matching rules
 
 Every line under a block the model owns ends up in exactly one place: **claimed** by the first template line that fully matches (template order); an **error** if it starts like a managed line (literals and key placeholders up to the first value placeholder match) but nothing fully matches, since silently leaving the field at its default would misrepresent the device; otherwise **unmanaged**, reported with its ancestors (`router bgp 65000 > neighbor 10.1.0.1 > bfd`). `@ignore` prefixes are checked first and always win. Headers are never strict: a `route-map` line whose sequence number doesn't decode is simply not one of ours.
+
+**Constant lines** are claimed like any other line and produce no data. If one is missing
+from its block (or, in a flat group, from any key's lines), parsing fails:
+``in `address-family ipv4 unicast`: constant line `exit-address-family` is missing (if this
+line is optional, declare a flag and write `exit-address-family [[ name ]]`)``. Present twice is
+`matched twice`; with extra tokens, or negated when the template line isn't, it is
+unrepresentable. A constant written with the negation word (`no ip domain-lookup`) is
+matched literally, so `ip domain-lookup` is then an error. Constants are rendered whatever the
+data (including their containers), never appear in the data or the JSON Schema, and in change
+sets are only written as part of an added block. An `@ignore` that covers a constant would
+make it unmatchable; that is reported when the set loads and by `netcfg lint`. The IOS example
+uses `neighbor {{ peer }} activate` in `templates/ios/bgp.nct`. Note that IOS's
+`exit-address-family` is printed beside each `address-family` block, not inside it, so it is
+`@ignore`d there rather than modelled as a constant.
 
 ## CLI
 

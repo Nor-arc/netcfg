@@ -1,6 +1,8 @@
 //! `netcfg lint`: warnings about a set that loads but may not do what its author meant.
 //!
 //! Always:
+//! - **ignored constants**: an `@ignore` prefix that covers a constant line, which then can
+//!   never be matched (also reported when the set loads);
 //! - **shadowed lines**: a template line after one with the same literal prefix that claims
 //!   (or rejects) every line starting that way, because lines are offered in template order;
 //! - **ambiguous claims**: nested models, or a nested model and a line, at the same level whose
@@ -61,7 +63,40 @@ impl Engine {
                 CShape::Flat { keys, lines } => self.lint_body(m, lines, &keys.literal_prefix(), &at, &mut out),
             }
         }
+        out.extend(self.ignored_constants());
         if let Some(g) = goldens { self.lint_goldens(g, &mut out); }
+        out
+    }
+
+    /// `@ignore` prefixes that cover a constant line at the same level: ignores are checked
+    /// before claims, so the constant could never be matched and every parse would fail.
+    pub(crate) fn ignored_constants(&self) -> Vec<Warning> {
+        fn go(m: &Compiled, slots: &[Slot], ignores: &[Vec<String>], key: &[String], out: &mut Vec<Warning>) {
+            for s in slots {
+                match s {
+                    Slot::Const { lits, text } => {
+                        let toks: Vec<String> = key.iter().cloned().chain(lits.literal_prefix().iter().map(|t| t.to_string())).collect();
+                        let toks: Vec<&str> = toks.iter().map(String::as_str).collect();
+                        if let Some(p) = ignores.iter().find(|p| ignore_matches(p, &toks)) {
+                            out.push(Warning { at: format!("{}: model {}: {}", m.source, m.name, lits.at), message: format!("`@ignore {}` covers the constant line `{text}`, so it could never be matched; remove one of them", p.join(" ")) });
+                        }
+                    }
+                    Slot::Container { body, ignores, .. } => go(m, body, ignores, &[], out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for m in self.models.values() {
+            match &m.shape {
+                CShape::Root { body } | CShape::Block { body, .. } => go(m, body, &m.ignores, &[], &mut out),
+                // A key placeholder only matches a `*` in an ignore prefix.
+                CShape::Flat { keys, lines } => {
+                    let key: Vec<String> = keys.toks.iter().map(|t| match t { PTok::Lit(s) => s.clone(), PTok::Hole { .. } => "\u{0}".into() }).collect();
+                    go(m, lines, &m.ignores, &key, &mut out)
+                }
+            }
+        }
         out
     }
 
@@ -72,7 +107,7 @@ impl Engine {
             CShape::Flat { keys, .. } => Some((keys.literal_prefix(), keys)),
             CShape::Root { body } => match body.first() {
                 Some(Slot::Line { pat, .. }) => Some((pat.literal_prefix(), pat)),
-                Some(Slot::Flag { lits, .. }) | Some(Slot::Container { lits, .. }) => Some((lits.literal_prefix(), lits)),
+                Some(Slot::Flag { lits, .. }) | Some(Slot::Container { lits, .. }) | Some(Slot::Const { lits, .. }) => Some((lits.literal_prefix(), lits)),
                 _ => None,
             },
         }
@@ -82,7 +117,7 @@ impl Engine {
         // Shadowed lines.
         let lines: Vec<(&Pattern, bool)> = slots.iter().filter_map(|s| match s {
             Slot::Line { pat, .. } => Some((pat, greedy(pat))),
-            Slot::Flag { lits, .. } => Some((lits, false)),
+            Slot::Flag { lits, .. } | Slot::Const { lits, .. } => Some((lits, false)),
             _ => None,
         }).collect();
         for (j, (b, _)) in lines.iter().enumerate() {

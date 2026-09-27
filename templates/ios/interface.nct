@@ -58,6 +58,7 @@ model Device
   interfaces: [Interface]
   routes: [StaticRoute]
   acls: [Acl]
+  bgp: IosBgp?
 
 template Device
   hostname {{ hostname }}
@@ -65,3 +66,4 @@ template Device
   << interfaces >>
   << routes >>
   << acls >>
+  << bgp >>
