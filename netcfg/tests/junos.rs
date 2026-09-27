@@ -123,7 +123,7 @@ fn strict_inside_containers() {
 
 #[test]
 fn user_declared_dialect_variant() {
-    let text = "dialect iosxe\n  extends: ios\n  skip: end, Building configuration, Current configuration, Load for\n\nmodel Host\n  hostname: string\n\ntemplate\n  hostname {{ hostname }}\n";
+    let text = "dialect iosxe\n  extends: ios\n  skip: end, Building configuration, Current configuration, Load for\n\nmodel Host\n  hostname: string\n\ntemplate Host\n  hostname {{ hostname }}\n";
     let e = Engine::from_text("iosxe.ttp", text, None).unwrap();
     assert_eq!(e.dialect.name, "iosxe");
     let p = e.parse("Host", "Building configuration...\nLoad for five secs: 1%/0%\nhostname r1\nend\n").unwrap();

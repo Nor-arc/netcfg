@@ -83,7 +83,7 @@ fn nxos_baseline() {
     let j = s.base_parsed.value.to_json();
     assert_eq!(j["routeMaps"][0]["matchPrefixLists"], serde_json::json!(["PL-1"]));
     assert_eq!(j["routeMaps"][1]["action"], "deny");
-    assert_eq!(j["bgp"][0]["neighbors"][0]["timers"], serde_json::json!([10, 30]));
+    assert_eq!(j["bgp"][0]["neighbors"][0]["timers"], serde_json::json!({"keepalive": 10, "hold": 30}));
     assert_eq!(j["bgp"][0]["neighbors"][0]["addressFamilies"][0]["routeMapIn"], "RM-IN");
     assert_eq!(j["bgp"][0]["neighbors"][0]["shutdown"], false);
     assert_eq!(s.base_parsed.unmanaged_paths(), vec!["version 9.3(8)"]);
@@ -186,8 +186,8 @@ fn eos_flat_groups() {
 
 #[test]
 fn ignore_is_explicit_opt_in() {
-    let strict = "model Logging\n  level: int?\n\ntemplate\n  logging level {{ level }}\n";
-    let lenient = "model Logging\n  level: int?\n\ntemplate\n  logging level {{ level }}\n  @ignore logging level bgp\n";
+    let strict = "model Logging\n  level: int?\n\ntemplate Logging\n  logging level {{ level }}\n";
+    let lenient = "model Logging\n  level: int?\n\ntemplate Logging\n  logging level {{ level }}\n  @ignore logging level bgp\n";
     let text = "logging level 5\nlogging level bgp 3\n";
     let e = Engine::from_text("t", strict, Some("nxos")).unwrap();
     assert!(e.parse("Logging", text).unwrap_err().0.contains("logging level bgp 3"));
@@ -199,12 +199,12 @@ fn ignore_is_explicit_opt_in() {
 
 #[test]
 fn template_validation_reports_everything() {
-    let bad = "model Iface\n  name: key string\n  description: phrase?\n  address: cidrx?\n  shutdown: flag\n\ntemplate\n  interface\n   name {{ name }}\n   description {{ descr }}\n   description {{ description }} end\n";
+    let bad = "model Iface\n  name: key string\n  description: phrase?\n  address: cidrx?\n  shutdown: flag\n\ntemplate Iface\n  interface\n   name {{ name }}\n   description {{ descr }}\n   description {{ description }} end\n";
     let err = Engine::from_text("bad.ttp", bad, Some("ios")).unwrap_err().0;
     for frag in ["unknown type `cidrx`", "`descr` is not a field of Iface", "Key field `name` must appear on the header line", "consumes the rest of the line"] {
         assert!(err.contains(frag), "missing `{frag}` in:\n{err}");
     }
-    let bad2 = "model Loose\n  x: int?\n\ntemplate\n  x {{ x }}\n\nmodel Holder\n  items: [Loose]\n\ntemplate\n  {{ items }}\n";
+    let bad2 = "model Loose\n  x: int?\n\ntemplate Loose\n  x {{ x }}\n\nmodel Holder\n  items: [Loose]\n\ntemplate Holder\n  << items >>\n";
     let err = Engine::from_text("bad2.ttp", bad2, Some("ios")).unwrap_err().0;
     assert!(err.contains("needs at least one key field"), "{err}");
 }
@@ -228,7 +228,7 @@ fn union_and_list_types() {
     let sch = s.e.schema("Device").unwrap();
     assert_eq!(sch["$defs"]["RouteMapEntry"]["properties"]["prependAsPath"]["anyOf"][0]["items"]["anyOf"][1]["enum"], serde_json::json!(["auto"]));
     // a bare unknown word in a union is an error, with a hint
-    let err = Engine::from_text("t", "type x = asn | auto\nmodel M\n  a: x\n\ntemplate\n  a {{ a }}\n", Some("nxos")).unwrap_err();
+    let err = Engine::from_text("t", "type x = asn | auto\nmodel M\n  a: x\n\ntemplate M\n  a {{ a }}\n", Some("nxos")).unwrap_err();
     assert!(err.0.contains("unknown type `auto`") && err.0.contains("quote it"), "{err}");
 }
 
@@ -242,7 +242,7 @@ fn ipv6_neighbors() {
     assert!(out.contains("  neighbor 2001:db8::1\n    remote-as 65010\n"), "{out}");
     // Neither family: the header doesn't decode, so it is not ours.
     s.unmanaged(&s.append("  neighbor 2001:db8::zz\n    remote-as 1\n"), "router bgp 65000 > neighbor 2001:db8::zz > remote-as 1");
-    let e = Engine::from_text("t", "model R\n  dst: key prefix\n  via: key ip\n\ntemplate\n  ip route {{ dst }} {{ via }}\n", Some("nxos")).unwrap();
+    let e = Engine::from_text("t", "model R\n  dst: key prefix\n  via: key ip\n\ntemplate R\n  ip route {{ dst }} {{ via }}\n", Some("nxos")).unwrap();
     let p = e.parse("R", "ip route 2001:db8:1::/48 2001:db8::1\n").unwrap();
     assert_eq!(p.value.to_json(), serde_json::json!({"dst": "2001:db8:1::/48", "via": "2001:db8::1"}));
     assert!(e.parse("R", "ip route 2001:db8:1::/129 2001:db8::1\n").unwrap_err().0.contains("expected exactly one R"));
@@ -250,8 +250,8 @@ fn ipv6_neighbors() {
 
 #[test]
 fn optional_trailing_value_via_empty_literal() {
-    let t = "type groupRef = string | \"\"\n\nmodel Nbr\n  peer: key ip\n  group: groupRef?\n  desc: phrase?\n\nmodel Bgp\n  asn: key asn\n  nbrs: [Nbr]\n\ntemplate\n  router bgp {{ asn }}\n    {{ nbrs }}\n";
-    let t = t.replace("model Bgp", "template\n  neighbor {{ peer }} group {{ group }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel Bgp");
+    let t = "type groupRef = string | \"\"\n\nmodel Nbr\n  peer: key ip\n  group: groupRef?\n  desc: phrase?\n\nmodel Bgp\n  asn: key asn\n  nbrs: [Nbr]\n\ntemplate Bgp\n  router bgp {{ asn }}\n    << nbrs >>\n";
+    let t = t.replace("model Bgp", "template Nbr\n  neighbor {{ peer }} group {{ group }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel Bgp");
     let e = Engine::from_text("t", &t, Some("eos")).unwrap();
     let cfg = "router bgp 1\n   neighbor 10.0.0.1 group\n   neighbor 10.0.0.2 group CORE\n   neighbor 10.0.0.3 description no group line\n";
     let p = e.parse("Bgp", cfg).unwrap();
@@ -262,7 +262,7 @@ fn optional_trailing_value_via_empty_literal() {
     assert!(p.unmanaged.is_empty());
     assert_eq!(e.render("Bgp", &p.value).unwrap(), cfg);
     // `""` must be the last placeholder on its line.
-    let bad = "type g = string | \"\"\n\nmodel M\n  a: key string\n  b: g\n  c: int\n\ntemplate\n  x {{ a }}\n    y {{ b }} {{ c }}\n";
+    let bad = "type g = string | \"\"\n\nmodel M\n  a: key string\n  b: g\n  c: int\n\ntemplate M\n  x {{ a }}\n    y {{ b }} {{ c }}\n";
     let err = Engine::from_text("t", bad, Some("eos")).unwrap_err();
     assert!(err.0.contains("`b` consumes the rest of the line, so it must be last"), "{err}");
 }
@@ -302,8 +302,8 @@ fn struct_types() {
 
 #[test]
 fn negation_forms() {
-    let t = "model Interface\n  name: key string\n  switchport: flag = true\n  address: cidr?\n  shutdown: flag\n\nmodel Dev\n  ifaces: [Interface]\n\ntemplate\n  {{ ifaces }}\n";
-    let t = t.replace("model Dev", "template\n  interface {{ name }}\n   switchport [[ switchport ]]\n   ip address {{ address }}\n   shutdown [[ shutdown ]]\n\nmodel Dev");
+    let t = "model Interface\n  name: key string\n  switchport: flag = true\n  address: cidr?\n  shutdown: flag\n\nmodel Dev\n  ifaces: [Interface]\n\ntemplate Dev\n  << ifaces >>\n";
+    let t = t.replace("model Dev", "template Interface\n  interface {{ name }}\n   switchport [[ switchport ]]\n   ip address {{ address }}\n   shutdown [[ shutdown ]]\n\nmodel Dev");
     let e = Engine::from_text("t", &t, Some("ios")).unwrap();
     let cfg = "interface Gi0/1\n no switchport\n ip address 10.0.0.1 255.255.255.0\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\ninterface Gi0/3\n no ip address\n no shutdown\n!\nend\n";
     let p = e.parse("Dev", cfg).unwrap();
@@ -329,8 +329,8 @@ fn negation_forms() {
 
 #[test]
 fn explicit_negated_flag_spelling_and_explain() {
-    let t = "model I\n  name: key string\n  shutdown: flag = true\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n";
-    let t = t.replace("model D", "template\n  interface {{ name }}\n   shutdown [[ shutdown ]]\n   no shutdown [[ shutdown ]]\n\nmodel D");
+    let t = "model I\n  name: key string\n  shutdown: flag = true\n\nmodel D\n  ifaces: [I]\n\ntemplate D\n  << ifaces >>\n";
+    let t = t.replace("model D", "template I\n  interface {{ name }}\n   shutdown [[ shutdown ]]\n   no shutdown [[ shutdown ]]\n\nmodel D");
     let e = Engine::from_text("t", &t, Some("ios")).unwrap();
     let p = e.parse("D", "interface Gi0/1\n no shutdown\ninterface Gi0/2\n shutdown\ninterface Gi0/3\n").unwrap();
     let j = p.value.to_json();
@@ -341,15 +341,15 @@ fn explicit_negated_flag_spelling_and_explain() {
     let x = e.explain("I").unwrap();
     assert!(x.contains("shutdown (flag, default true)\n  true     → shutdown  (nothing written: default)\n  false    → no shutdown\n"), "{x}");
     // A negated line without its positive partner is an error.
-    let bad = "model I\n  name: key string\n  shutdown: flag\n\ntemplate\n  interface {{ name }}\n   no shutdown [[ shutdown ]]\n";
+    let bad = "model I\n  name: key string\n  shutdown: flag\n\ntemplate I\n  interface {{ name }}\n   no shutdown [[ shutdown ]]\n";
     let err = Engine::from_text("t", bad, Some("ios")).unwrap_err();
     assert!(err.0.contains("needs a normal line for this negated flag spelling"), "{err}");
 }
 
 #[test]
 fn implicit_negated_absent_form() {
-    let t = "model I\n  name: key string\n  address: cidr?\n  mtu: int = 1500\n  description: phrase?\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n";
-    let t = t.replace("model D", "template\n  interface {{ name }}\n   ip address {{ address }}\n   mtu {{ mtu }}\n   description {{ description }}\n\nmodel D");
+    let t = "model I\n  name: key string\n  address: cidr?\n  mtu: int = 1500\n  description: phrase?\n\nmodel D\n  ifaces: [I]\n\ntemplate D\n  << ifaces >>\n";
+    let t = t.replace("model D", "template I\n  interface {{ name }}\n   ip address {{ address }}\n   mtu {{ mtu }}\n   description {{ description }}\n\nmodel D");
     let e = Engine::from_text("t", &t, Some("ios")).unwrap();
     let p = e.parse("D", "interface Gi0/1\n no ip address\n no mtu\n no description\n").unwrap();
     let j = p.value.to_json();
@@ -367,15 +367,15 @@ fn implicit_negated_absent_form() {
     assert!(e.parse("D", "interface Gi0/1\n no ip address 10.0.0.1 255.255.255.0\n").unwrap_err().0.contains("starts like a managed line"));
     assert!(e.parse("D", "interface Gi0/1\n no ip address\n ip address 10.0.0.1 255.255.255.0\n").unwrap_err().0.contains("matched twice"));
     // Flat groups too.
-    let f = "model N\n  peer: key ip\n  remoteAs: asn?\n  desc: phrase?\n\nmodel B\n  asn: key asn\n  nbrs: [N]\n\ntemplate\n  router bgp {{ asn }}\n    {{ nbrs }}\n";
-    let f = f.replace("model B", "template\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel B");
+    let f = "model N\n  peer: key ip\n  remoteAs: asn?\n  desc: phrase?\n\nmodel B\n  asn: key asn\n  nbrs: [N]\n\ntemplate B\n  router bgp {{ asn }}\n    << nbrs >>\n";
+    let f = f.replace("model B", "template N\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} description {{ desc }}\n\nmodel B");
     let e = Engine::from_text("t", &f, Some("eos")).unwrap();
     let p = e.parse("B", "router bgp 1\n   neighbor 10.0.0.1 remote-as 65001\n   no neighbor 10.0.0.1 description\n").unwrap();
     assert_eq!(p.value.to_json()["nbrs"][0], serde_json::json!({"peer": "10.0.0.1", "remoteAs": 65001, "desc": null}));
     assert!(e.render("B", &p.value).unwrap().contains("   no neighbor 10.0.0.1 description\n"));
     assert!(e.parse("B", "router bgp 1\n   no neighbor 10.0.0.1 remote-as 65001\n").unwrap_err().0.contains("starts like a managed line"));
     // No negation word in the dialect: `no ip address` is just an unknown line.
-    let jt = "model I\n  name: key string\n  address: cidr?\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n".replace("model D", "template\n  interface {{ name }} {\n    ip address {{ address }};\n  }\n\nmodel D");
+    let jt = "model I\n  name: key string\n  address: cidr?\n\nmodel D\n  ifaces: [I]\n\ntemplate D\n  << ifaces >>\n".replace("model D", "template I\n  interface {{ name }} {\n    ip address {{ address }};\n  }\n\nmodel D");
     let j = Engine::from_text("t", &jt, Some("junos")).unwrap();
     let p = j.parse("D", "interface Gi0/1 { no ip address; }").unwrap();
     assert_eq!(p.unmanaged_paths(), vec!["interface Gi0/1 > no ip address"]);
@@ -385,7 +385,7 @@ fn implicit_negated_absent_form() {
 
 #[test]
 fn struct_with_optional_leading_modifier() {
-    let t = "type communityMatch = {{ mode: \"or-results\" | \"\" }} {{ names: list(string) }}\n\nmodel Rm\n  name: key string\n  seq: key int\n  matchCommunity: communityMatch?\n\ntemplate\n  route-map {{ name }} permit {{ seq }}\n    match community {{ matchCommunity }}\n";
+    let t = "type communityMatch = {{ mode: \"or-results\" | \"\" }} {{ names: list(string) }}\n\nmodel Rm\n  name: key string\n  seq: key int\n  matchCommunity: communityMatch?\n\ntemplate Rm\n  route-map {{ name }} permit {{ seq }}\n    match community {{ matchCommunity }}\n";
     let e = Engine::from_text("t", t, Some("nxos")).unwrap();
     let parse = |line: &str| e.parse("Rm", &format!("route-map RM permit 10\n  match community {line}\n")).unwrap().value.to_json()["matchCommunity"].clone();
     assert_eq!(parse("CL-A"), serde_json::json!({"names": ["CL-A"]}));
@@ -404,13 +404,13 @@ fn struct_with_optional_leading_modifier() {
 fn negated_value_line_is_not_dropped() {
     let s = Suite::new("eos", "EosDevice", EO);
     // Top-level keyed parse is as strict as nested parse.
-    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyAction: string?\n\ntemplate\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy {{ prePolicyAction }}\n";
+    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyAction: string?\n\ntemplate N\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy {{ prePolicyAction }}\n";
     let e = Engine::from_text("t", t, Some("eos")).unwrap();
     let err = e.parse("N", "neighbor 1.1.1.1 remote-as 65431\nno neighbor 1.1.1.1 rib-in pre-policy retain\n").unwrap_err();
     assert!(err.0.contains("no neighbor 1.1.1.1 rib-in pre-policy retain`: starts like a managed line") && err.0.contains("model it as a flag"), "{err}");
     let _ = s;
     // Modelled as a flag with the device default, it round-trips.
-    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyRetainAll: flag\n  prePolicyRetain: flag = true\n\ntemplate\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy retain all [[ prePolicyRetainAll ]]\n  neighbor {{ peer }} rib-in pre-policy retain [[ prePolicyRetain ]]\n";
+    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyRetainAll: flag\n  prePolicyRetain: flag = true\n\ntemplate N\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy retain all [[ prePolicyRetainAll ]]\n  neighbor {{ peer }} rib-in pre-policy retain [[ prePolicyRetain ]]\n";
     let e = Engine::from_text("t", t, Some("eos")).unwrap();
     let cfg = "neighbor 1.1.1.1 remote-as 65431\nno neighbor 1.1.1.1 rib-in pre-policy retain\nneighbor 1.1.1.2 remote-as 65432\nneighbor 1.1.1.2 rib-in pre-policy retain all\n";
     let p = e.parse("N", &cfg.replace("neighbor 1.1.1.2 remote-as 65432\nneighbor 1.1.1.2 rib-in pre-policy retain all\n", "")).unwrap();
@@ -423,12 +423,12 @@ fn negated_value_line_is_not_dropped() {
 #[test]
 fn flag_marker_and_anonymous_struct() {
     // {{ }} on a flag and [[ ]] on a value are both rejected, with the fix in the message.
-    let bad = "model I\n  name: key string\n  shutdown: flag\n  mtu: int?\n\ntemplate\n  interface {{ name }}\n   shutdown {{ shutdown }}\n   mtu [[ mtu ]]\n";
+    let bad = "model I\n  name: key string\n  shutdown: flag\n  mtu: int?\n\ntemplate I\n  interface {{ name }}\n   shutdown {{ shutdown }}\n   mtu [[ mtu ]]\n";
     let err = Engine::from_text("t", bad, Some("ios")).unwrap_err().0;
     assert!(err.contains("`shutdown` is a flag: write it as [[ shutdown ]]"), "{err}");
     assert!(err.contains("`mtu` is not a flag: [[ ]] is for flags"), "{err}");
     // Anonymous struct type on a field, optional.
-    let t = "model N\n  peer: key ip\n  maximumRoutes: {{ limit: int }} {{ action: \"warning-only\" | \"\" }}?\n  timers: {{ keepalive: int }} {{ hold: int }}\n\ntemplate\n  neighbor {{ peer }}\n    maximum-routes {{ maximumRoutes }}\n    timers {{ timers }}\n";
+    let t = "model N\n  peer: key ip\n  maximumRoutes: {{ limit: int }} {{ action: \"warning-only\" | \"\" }}?\n  timers: {{ keepalive: int }} {{ hold: int }}\n\ntemplate N\n  neighbor {{ peer }}\n    maximum-routes {{ maximumRoutes }}\n    timers {{ timers }}\n";
     let e = Engine::from_text("t", t, Some("nxos")).unwrap();
     let p = e.parse("N", "neighbor 10.0.0.1\n  maximum-routes 1200 warning-only\n  timers 10 30\n").unwrap();
     assert_eq!(p.value.to_json(), serde_json::json!({"peer": "10.0.0.1", "maximumRoutes": {"limit": 1200, "action": "warning-only"}, "timers": {"keepalive": 10, "hold": 30}}));

@@ -15,7 +15,7 @@ enum Format { Json, Yaml }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Load every .ttp file under a directory and report all errors.
+    /// Load every .nct file under a directory and report all errors.
     Validate { templates: PathBuf, #[arg(long)] dialect: Option<String> },
     /// Parse a running config into model data (JSON/YAML) plus the unmanaged report.
     Parse {
@@ -34,12 +34,40 @@ enum Cmd {
     Explain { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
     /// Print the JSON Schema for a model's data.
     Schema { templates: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String> },
+    /// Rewrite .nct files to the current form: named templates, each placed after its model.
+    Fmt {
+        /// Files or directories (searched recursively for .nct/.ttp files).
+        #[arg(required = true)] paths: Vec<PathBuf>,
+        /// Only rename bare templates; don't move templates next to their models.
+        #[arg(long)] keep_order: bool,
+        /// Don't write; exit non-zero if any file would change.
+        #[arg(long)] check: bool,
+    },
     /// Time parse and render on a config.
     Bench { templates: PathBuf, config: PathBuf, #[arg(long)] model: String, #[arg(long)] dialect: Option<String>, #[arg(long, default_value_t = 5)] runs: usize },
 }
 
 fn load(templates: &PathBuf, dialect: &Option<String>) -> Result<Engine, String> {
-    Engine::load_dir(templates, dialect.as_deref()).map_err(|e| e.0)
+    let e = Engine::load_dir(templates, dialect.as_deref()).map_err(|e| e.0)?;
+    for w in &e.warnings { eprintln!("warning: {w}"); }
+    Ok(e)
+}
+
+fn template_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    fn walk(p: &std::path::Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        if p.is_dir() {
+            for e in std::fs::read_dir(p)? { walk(&e?.path(), out)?; }
+        } else if netcfg::engine::is_template_file(p) {
+            out.push(p.to_path_buf());
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_file() { out.push(p.clone()); } else { walk(p, &mut out).map_err(|e| format!("{}: {e}", p.display()))?; }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn read_data(path: &PathBuf) -> Result<Value, String> {
@@ -86,6 +114,21 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Schema { templates, model, dialect: d } => {
             let e = load(&templates, &d)?;
             println!("{}", serde_json::to_string_pretty(&e.schema(&model).map_err(|e| e.0)?).unwrap());
+            Ok(())
+        }
+        Cmd::Fmt { paths, keep_order, check } => {
+            let mut changed = Vec::new();
+            for p in template_files(&paths)? {
+                let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                netcfg::model::parse(&p.display().to_string(), &text).map_err(|e| e.0)?;
+                let out = netcfg::fmt::format(&text, !keep_order);
+                if out != text {
+                    if !check { std::fs::write(&p, &out).map_err(|e| format!("{}: {e}", p.display()))?; }
+                    changed.push(p.display().to_string());
+                }
+            }
+            for c in &changed { println!("{} {c}", if check { "would reformat" } else { "reformatted" }); }
+            if check && !changed.is_empty() { return Err(format!("{} file(s) need formatting", changed.len())); }
             Ok(())
         }
         Cmd::Bench { templates, config, model, dialect: d, runs } => {

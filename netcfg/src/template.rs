@@ -1,4 +1,5 @@
-//! Template text: config-shaped lines with `{{ field }}` placeholders and `@ignore` lines.
+//! Template text: config-shaped lines with `{{ value }}`, `[[ flag ]]` and `<< model >>`
+//! placeholders, and `@ignore` lines.
 //! Parsing and validation are pure functions over the model's field declarations, so the
 //! loader, the CLI validator and a language server all agree on what a valid template is.
 
@@ -12,6 +13,8 @@ pub enum Tok {
     Hole(String),
     /// `[[ field ]]`: consumes nothing; the line's presence is the flag's value.
     Flag(String),
+    /// `<< field >>`: whole statements/blocks of a nested model at this level.
+    Nest(String),
 }
 
 #[derive(Debug, Clone)]
@@ -24,15 +27,15 @@ pub struct TLine {
 }
 
 impl TLine {
-    /// Every bound field name, `{{ }}` and `[[ ]]` alike.
+    /// Every bound field name, `{{ }}`, `[[ ]]` and `<< >>` alike.
     pub fn holes(&self) -> Vec<&str> {
-        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) | Tok::Flag(n) => Some(n.as_str()), _ => None }).collect()
+        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) | Tok::Flag(n) | Tok::Nest(n) => Some(n.as_str()), _ => None }).collect()
     }
     pub fn lits(&self) -> Vec<String> {
         self.toks.iter().filter_map(|t| match t { Tok::Lit(s) => Some(s.clone()), _ => None }).collect()
     }
     pub fn text(&self) -> String {
-        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]") }).collect::<Vec<_>>().join(" ")
+        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]"), Tok::Nest(n) => format!("<< {n} >>") }).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -62,8 +65,10 @@ pub fn from_nodes(nodes: &[crate::lexer::Node<'_>], first_line: usize) -> Result
                 Tok::Hole(inner.trim().to_string())
             } else if let Some(inner) = w.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
                 Tok::Flag(inner.trim().to_string())
+            } else if let Some(inner) = w.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+                Tok::Nest(inner.trim().to_string())
             } else {
-                if w.contains("{{") || w.contains("}}") || w.contains("[[") || w.contains("]]") { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value) or [[ name ]] (flag)")); }
+                if ["{{", "}}", "[[", "]]", "<<", ">>"].iter().any(|m| w.contains(m)) { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value), [[ name ]] (flag) or << name >> (nested model)")); }
                 Tok::Lit(w.to_string())
             }
         }).collect();
@@ -202,14 +207,25 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
         if !allow_keys {
             for k in l.holes() { if keys.contains(&k) { err(errs, l, format!("Key field `{k}` belongs on the header line")); } }
         }
-        if let Some(m) = metas.iter().find(|m| m.kind == Kind::Many) {
-            if l.toks.len() != 1 { err(errs, l, format!("collection `{{{{ {} }}}}` must be alone on its line", m.name)); }
-        }
         for t in &l.toks {
+            let kind = |n: &str| by_name(n).map(|f| f.kind);
             match t {
-                Tok::Hole(n) => if by_name(n).map(|f| f.kind == Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is a flag: write it as [[ {n} ]] (the line's presence), not {{{{ {n} }}}} (a value)")); },
-                Tok::Flag(n) => if by_name(n).map(|f| f.kind != Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is not a flag: [[ ]] is for flags; a value is written {{{{ {n} }}}}")); },
-                _ => {}
+                Tok::Hole(n) => match kind(n) {
+                    Some(Kind::Flag) => err(errs, l, format!("`{n}` is a flag: write it as [[ {n} ]] (the line's presence), not {{{{ {n} }}}} (a value)")),
+                    Some(k) if k.is_nested() => err(errs, l, format!("`{n}` is a nested model: write it as << {n} >> alone on its line, not {{{{ {n} }}}} (a value)")),
+                    _ => {}
+                },
+                Tok::Flag(n) => match kind(n) {
+                    Some(k) if k.is_nested() => err(errs, l, format!("`{n}` is a nested model: write it as << {n} >> alone on its line, not [[ {n} ]] (a flag)")),
+                    Some(k) if k != Kind::Flag => err(errs, l, format!("`{n}` is not a flag: [[ ]] is for flags; a value is written {{{{ {n} }}}}")),
+                    _ => {}
+                },
+                Tok::Nest(n) => match kind(n) {
+                    Some(Kind::Flag) => err(errs, l, format!("`{n}` is a flag, not a nested model: write it as [[ {n} ]]")),
+                    Some(k) if !k.is_nested() => err(errs, l, format!("`{n}` is a value, not a nested model: << >> is for [Model] and Model? fields; a value is written {{{{ {n} }}}}")),
+                    _ => if l.toks.len() != 1 { err(errs, l, format!("<< {n} >> must be alone on its line")); },
+                },
+                Tok::Lit(_) => {}
             }
         }
         if let Some(m) = metas.iter().find(|m| m.kind == Kind::Flag) {
@@ -247,7 +263,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
                 let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) | Tok::Flag(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));
                 let last_key = l.toks.iter().rposition(|t| matches!(t, Tok::Hole(n) if keys.contains(&n.as_str())));
                 if let (Some(fv), Some(lk)) = (first_value, last_key) { if lk > fv { err(&mut errs, l, "Key placeholders must come before value placeholders".into()); } }
-                if l.holes().into_iter().filter_map(by_name).any(|m| m.kind == Kind::Many) { err(&mut errs, l, "a flat group line cannot hold a collection".into()); }
+                if l.holes().into_iter().filter_map(by_name).any(|m| m.kind.is_nested()) { err(&mut errs, l, "a flat group line cannot hold a nested model".into()); }
                 check_body_line(&mut errs, l, true, false, &check_value_line);
             }
         }

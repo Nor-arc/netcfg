@@ -1,7 +1,7 @@
 # netcfg (Rust)
 
 Bidirectional network-config templates as a Rust core, a CLI, and a Python package.
-Authors write `.ttp` files (a model declaration plus config-shaped template text); the
+Authors write `.nct` files (model declarations plus config-shaped template text); the
 same template parses a running config into data and renders data back into config.
 No Scala, no code generation: templates and dialects are loaded and validated at runtime,
 and the data side is plain dicts / JSON / YAML with a generated JSON Schema.
@@ -14,17 +14,49 @@ model RouteMapEntry
   action: action
   seq: key int
   description: phrase?
-  matchPrefixLists: names?
+  matchPrefixLists: list(string)?
   setLocalPref: int?
 
-template
+template RouteMapEntry
   route-map {{ name }} {{ action }} {{ seq }}
     description {{ description }}
     match ip address prefix-list {{ matchPrefixLists }}
     set local-preference {{ setLocalPref }}
 ```
 
-## The `.ttp` format
+## Relationship to TTP
+
+The `{{ placeholder }}` syntax is borrowed from [TTP](https://github.com/dmulyalin/ttp)
+(Template Text Parser), with thanks. netcfg differs in what it is for:
+
+- **Bidirectional.** The same template parses config into data and renders data into config.
+- **Model-declared structure.** Fields, types, keys, collections and defaults are declared in
+  a `model`; the template only places them. There are no expressions, filters or
+  conditionals in template lines, so every decision is recoverable from the config text.
+- **Strict matching.** A line that starts like a managed line but doesn't fully match is an
+  error, never silently dropped; `@ignore` is the only opt-out.
+- **Typed codecs.** Values are parsed and written by typed codecs (`ipv4`, `asn`, `cidr`,
+  structs, unions), and the data has a generated JSON Schema.
+- **Rust engine** with a CLI and Python bindings.
+
+Files used the `.ttp` extension until 0.4; that collides with TTP, so the extension is now
+`.nct`. `.ttp` files still load for one release, with a deprecation warning.
+
+## The `.nct` format
+
+A set is a directory of `.nct` files. Each holds `dialect`, `type`, `model` (and
+`fragment`) declarations and `template NAME` sections. A template names the model it
+belongs to and may sit anywhere in the set; `netcfg fmt` places each one directly after
+its model. (A bare `template` still pairs with the model above it, with a deprecation
+warning, for one release; `netcfg fmt` rewrites it.)
+
+Templates use three placeholder markers, one per kind of field:
+
+| Marker | Consumes | Field kinds |
+|---|---|---|
+| `{{ field }}` | tokens on the line | key, required value, optional, defaulted |
+| `[[ flag ]]` | nothing (the line's presence) | flag |
+| `<< model >>` | whole statements/blocks at this level; alone on its line | `[Model]` collection, `Model` / `Model?` singleton |
 
 | Declaration | Meaning |
 |---|---|
@@ -33,7 +65,8 @@ template
 | `f: T = default` | Required, with a default used when the line is absent; the line is omitted when rendering the default. |
 | `f: T?` | The line is optional. |
 | `f: flag` / `f: flag = true` (written `[[ f ]]` in the template) | Presence of a literal line; `<negation> <line>` is `false`. Set the default to the device's default so negated lines render exactly when needed. A flag whose template literals start with the negation word (`no ip address {{ cleared }}`) is matched literally and only has that spelling. |
-| `f: [Model]` | A keyed collection; `{{ f }}` alone on a line stands for all of its blocks/lines. |
+| `f: [Model]` | A keyed collection; `<< f >>` alone on a line stands for all of its blocks/lines. |
+| `f: Model?` / `f: Model` | A singleton nested model (optional / required): at most one block or group of `Model` at this level, a second is a `duplicate` error. The data is a record, or the key is missing when absent. A model without keys can be a singleton if its template has exactly one top-level line (`snmp-server` with nested lines); that line is its identity. |
 | `type name = /regex/` | One-token type validated by a regex. |
 | `type name = "a" \| "b"` | Enumeration of literal tokens (quoted). |
 | `type name = asn \| "auto"` | Union: alternatives tried in order; bare names are types, quoted words are literals. |
@@ -43,13 +76,15 @@ template
 | `list(T)` | Rest-of-line list of `T` (`prependAsPath: list(prependItem)?`). `T` must be a one-token type. |
 | `@ignore word word *` | Explicit opt-out: lines starting with these words are reported as unmanaged, never errors. |
 
-Builtin types: `string`, `int`, `int(lo..hi)`, `list(T)`, `ipv4`, `ipv6`, `ip` (either), `cidr` (dialect-dependent: `addr/len` on NX-OS/EOS, `addr mask` on IOS; the value is always `addr/len`), `ipv6cidr`, `prefix` (either), `asn` (asplain or asdot in, asplain out), `intpair`, and the rest-of-line types `phrase`, `names`, `ints`. Domain types with real parsing logic are added in Rust by implementing the `Scalar` trait.
+Builtin types: `string`, `int`, `int(lo..hi)`, `list(T)`, `phrase` (free text to the end of the line), `ipv4`, `ipv6`, `ip` (either), `cidr` (dialect-dependent: `addr/len` on NX-OS/EOS, `addr mask` on IOS; the value is always `addr/len`), `ipv6cidr`, `prefix` (either), `asn` (asplain or asdot in, asplain out). Numbers are integers only. Domain types with real parsing logic are added in Rust by implementing the `Scalar` trait.
+
+`names`, `ints` and `intpair` were removed in 0.4: write `list(string)`, `list(int)`, and a struct with named parts (`timers: {{ keepalive: int }} {{ hold: int }}?`, data `{keepalive: 10, hold: 30}` instead of `[10, 30]`). The loader names the replacement if an old type is used. Note that `list(int)` validates every element, so config with a non-integer in such a position is now a strict error rather than accepted.
 
 Template shapes are inferred: one header line with nested lines is a **block**; several sibling lines that all carry the key are a **flat group** (EOS/IOS `neighbor X …` lines); a model without keys is a **root** document.
 
 ## Dialects
 
-A dialect is declared, not coded, in a `dialect` section (conventionally `dialect.ttp` next to the templates):
+A dialect is declared, not coded, in a `dialect` section (conventionally `dialect.nct` next to the templates):
 
 ```text
 dialect junos
@@ -66,13 +101,13 @@ dialect iosxe
 Properties: `grammar`, `indent`, `comments`, `skip`, `block-separator`, `end-marker`, `negation` (the prefix that negates a flag line, `no`), `render`, and type knobs such as `cidr`. Templates are lexed with the dialect's grammar, so a Junos template is written in Junos syntax:
 
 ```text
-template
+template JunosDevice
   system {
       host-name {{ hostname }};
   }
   protocols {
       bgp {
-          {{ groups }}
+          << groups >>
       }
   }
 ```
@@ -105,6 +140,7 @@ netcfg render  templates/nxos intent.yaml  --model Device
 netcfg explain templates/ios  --model Interface     # how each field is spelled: value, absent, true/false, defaults
 netcfg schema  templates/nxos --model Device        # JSON Schema for editor completion/validation
 netcfg bench   templates/nxos running.cfg --model Device --runs 5
+netcfg fmt     templates/                           # named templates, each after its model (--check, --keep-order)
 ```
 `--dialect NAME` selects a builtin when the templates don't declare one.
 ```
@@ -125,6 +161,7 @@ text = e.render("Device", r.value)
 schema = e.schema("Device")
 ```
 The GIL is released during `parse` and `render`, so a thread pool parallelises across cores.
+`netcfg-py/smoke.py` exercises the installed wheel (`python netcfg-py/smoke.py`).
 
 ## Tests and equivalence
 
@@ -146,7 +183,8 @@ Comparable to the tuned JVM engine, with no warm-up, no GC tuning and a flat mem
 netcfg/src/lexer.rs      indent and braces grammars; tokens borrow from the input
 netcfg/src/dialect.rs    declared dialects (builtins are declarations too); grammar selection, rendering
 netcfg/src/types.rs      Scalar trait and the builtin catalog
-netcfg/src/model.rs      .ttp file parser (type / model / template sections)
+netcfg/src/model.rs      .nct file parser (dialect / type / model / fragment / template sections)
+netcfg/src/fmt.rs        `netcfg fmt`: rewrite files to named templates
 netcfg/src/template.rs   template text parser, shape inference, validation (pure functions)
 netcfg/src/engine.rs     compile to patterns/slots; strict node-major parse; render
 netcfg/src/schema.rs     JSON Schema from model declarations

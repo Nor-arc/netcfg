@@ -16,7 +16,7 @@ model NeighborAf
   nextHopSelf: flag
   softReconfigInbound: flag
 
-template
+template NeighborAf
   address-family {{ afi }} {{ safi }}
     send-community [[ sendCommunity ]]
     send-community extended [[ sendCommunityExtended ]]
@@ -33,11 +33,11 @@ model Neighbor
   description: phrase?
   updateSource: string?
   ebgpMultihop: int(2..255)?
-  timers: intpair?
+  timers: {{ keepalive: int }} {{ hold: int }}?
   shutdown: flag
   addressFamilies: [NeighborAf]
 
-template
+template Neighbor
   neighbor {{ peer }}
     remote-as {{ remoteAs }}
     inherit peer {{ inheritPeer }}
@@ -46,7 +46,7 @@ template
     ebgp-multihop {{ ebgpMultihop }}
     timers {{ timers }}
     shutdown [[ shutdown ]]
-    {{ addressFamilies }}
+    << addressFamilies >>
 
 model PeerTemplate
   name: key string
@@ -55,7 +55,7 @@ model PeerTemplate
   updateSource: string?
   ebgpMultihop: int(2..255)?
 
-template
+template PeerTemplate
   template peer {{ name }}
     remote-as {{ remoteAs }}
     description {{ description }}
@@ -69,19 +69,19 @@ model Bgp
   peerTemplates: [PeerTemplate]
   neighbors: [Neighbor]
 
-template
+template Bgp
   router bgp {{ asn }}
     router-id {{ routerId }}
     log-neighbor-changes [[ logNeighborChanges ]]
-    {{ peerTemplates }}
-    {{ neighbors }}
+    << peerTemplates >>
+    << neighbors >>
 
 model Device
   hostname: string
   routeMaps: [RouteMapEntry]
   bgp: [Bgp]
 
-template
+template Device
   hostname {{ hostname }}
-  {{ routeMaps }}
-  {{ bgp }}
+  << routeMaps >>
+  << bgp >>

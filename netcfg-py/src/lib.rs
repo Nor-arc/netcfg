@@ -8,7 +8,7 @@
 //! ```
 
 use netcfg_core::{Engine as Core, Value};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyDeprecationWarning, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList};
 
@@ -68,6 +68,13 @@ struct Parsed {
     unmanaged: Vec<String>,
 }
 
+fn warn(py: Python<'_>, core: &Core) -> PyResult<()> {
+    for w in &core.warnings {
+        PyErr::warn_bound(py, &py.get_type_bound::<PyDeprecationWarning>(), w, 1)?;
+    }
+    Ok(())
+}
+
 #[pyclass]
 struct Engine {
     core: Core,
@@ -75,21 +82,30 @@ struct Engine {
 
 #[pymethods]
 impl Engine {
-    /// Load every `.ttp` file under `templates`. `dialect` names a builtin (ios, nxos, eos,
-    /// junos) used only when the templates don't declare their own.
+    /// Load every `.nct` file under `templates`. `dialect` names a builtin (ios, nxos, eos,
+    /// junos) used only when the templates don't declare their own. Deprecated forms in the
+    /// templates are reported as `DeprecationWarning`s.
     #[new]
     #[pyo3(signature = (templates, dialect = None))]
-    fn new(templates: &str, dialect: Option<&str>) -> PyResult<Self> {
+    fn new(py: Python<'_>, templates: &str, dialect: Option<&str>) -> PyResult<Self> {
         let core = Core::load_dir(std::path::Path::new(templates), dialect).map_err(|e| PyValueError::new_err(e.0))?;
+        warn(py, &core)?;
         Ok(Engine { core })
     }
 
     /// Build an engine from template text instead of a directory.
     #[staticmethod]
     #[pyo3(signature = (text, dialect = None))]
-    fn from_text(text: &str, dialect: Option<&str>) -> PyResult<Self> {
+    fn from_text(py: Python<'_>, text: &str, dialect: Option<&str>) -> PyResult<Self> {
         let core = Core::from_text("<text>", text, dialect).map_err(|e| PyValueError::new_err(e.0))?;
+        warn(py, &core)?;
         Ok(Engine { core })
+    }
+
+    /// Non-fatal notes from loading (deprecations), each naming file and line.
+    #[getter]
+    fn warnings(&self) -> Vec<String> {
+        self.core.warnings.clone()
     }
 
     #[getter]

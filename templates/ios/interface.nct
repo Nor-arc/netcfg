@@ -4,7 +4,7 @@ model Vlan
   id: key vlanId
   name: string?
 
-template
+template Vlan
   vlan {{ id }}
    name {{ name }}
 
@@ -16,7 +16,7 @@ model Interface
   accessVlan: vlanId?
   shutdown: flag
 
-template
+template Interface
   interface {{ name }}
    description {{ description }}
    ip address {{ address }}
@@ -30,7 +30,7 @@ model StaticRoute
   prefix: key cidr
   nextHop: key ipv4
 
-template
+template StaticRoute
   ip route {{ prefix }} {{ nextHop }}
 
 model Device
@@ -39,8 +39,8 @@ model Device
   interfaces: [Interface]
   routes: [StaticRoute]
 
-template
+template Device
   hostname {{ hostname }}
-  {{ vlans }}
-  {{ interfaces }}
-  {{ routes }}
+  << vlans >>
+  << interfaces >>
+  << routes >>

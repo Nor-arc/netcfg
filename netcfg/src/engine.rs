@@ -1,4 +1,4 @@
-//! Compiles `.ttp` models into patterns and slots, then parses and renders with them.
+//! Compiles `.nct` models into patterns and slots, then parses and renders with them.
 //!
 //! Matching is node-major and strict: each config line is offered to the slots in template
 //! order; the first full match claims it. An unclaimed line that *starts like* a managed
@@ -109,10 +109,17 @@ enum Mode {
 enum Slot {
     Line { pat: Pattern, mode: Mode },
     Flag { lits: Pattern, field: usize, default: bool },
-    Many { field: usize, model: usize },
+    /// `<< field >>`: blocks/groups of a nested model.
+    Nested { field: usize, model: usize, card: Card },
     /// A literal-only line with nested lines (`protocols {`, `bgp {`): its children are
     /// body lines of the same model.
     Container { lits: Pattern, body: Vec<Slot>, ignores: Vec<Vec<String>> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Card {
+    Many,
+    Single { required: bool },
 }
 
 enum CShape {
@@ -141,6 +148,8 @@ pub struct Engine {
     pub dialect: Dialect,
     pub catalog: Catalog,
     models: IndexMap<String, Compiled>,
+    /// Non-fatal notes from loading (deprecations), each naming file and line.
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -162,7 +171,7 @@ impl Parsed {
 // ---- compilation --------------------------------------------------------------------------
 
 impl Engine {
-    /// Compile a set of parsed `.ttp` files. The dialect comes from a `dialect` section in
+    /// Compile a set of parsed `.nct` files. The dialect comes from a `dialect` section in
     /// the files if there is one, otherwise from `fallback` (a builtin name).
     pub fn build(files: &[model::File], fallback: Option<&str>) -> Result<Engine> {
         let declared: Vec<&model::DialectDef> = files.iter().filter_map(|f| f.dialect.as_ref()).collect();
@@ -176,6 +185,7 @@ impl Engine {
         };
         let mut catalog = Catalog::builtin(&dialect.knobs).map_err(Error)?;
         let mut errors: Vec<String> = Vec::new();
+        let warnings: Vec<String> = files.iter().flat_map(|f| f.warnings.iter().cloned()).collect();
         for t in files.iter().flat_map(|f| f.types.iter()) {
             if catalog.get(&t.name).is_some() { errors.push(format!("type `{}` (line {}) is already defined", t.name, t.line)); continue; }
             match &t.def {
@@ -190,11 +200,53 @@ impl Engine {
                 },
             }
         }
-        let defs: Vec<&model::ModelDef> = files.iter().flat_map(|f| f.models.iter()).collect();
-        let index: IndexMap<&str, usize> = defs.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
+        let mut defs: Vec<model::ModelDef> = files.iter().flat_map(|f| f.models.iter().cloned()).collect();
+        let mut seen: IndexMap<String, usize> = IndexMap::new();
         for (i, d) in defs.iter().enumerate() {
-            if index[d.name.as_str()] != i { errors.push(format!("{}:{}: model `{}` is already defined", d.source, d.line, d.name)); }
+            if let Some(&j) = seen.get(&d.name) { errors.push(format!("{}:{}: model `{}` is already defined at {}:{}", d.source, d.line, d.name, defs[j].source, defs[j].line)); }
+            else { seen.insert(d.name.clone(), i); }
         }
+        // Pair every `template NAME` with its model or fragment, by name, across the set.
+        let mut paired: IndexMap<String, &model::TemplateDef> = IndexMap::new();
+        for t in files.iter().flat_map(|f| f.templates.iter()) {
+            let Some(&i) = seen.get(&t.model) else {
+                let names: Vec<&str> = seen.keys().map(String::as_str).collect();
+                errors.push(format!("{}:{}: `template {}` names no model or fragment (known: {})", t.source, t.line, t.model, names.join(", ")));
+                continue;
+            };
+            if let Some(first) = paired.get(&t.model) {
+                errors.push(format!("{}:{}: second template for {} (the first is at {}:{}); a model has exactly one template", t.source, t.line, t.model, first.source, first.line));
+                continue;
+            }
+            paired.insert(t.model.clone(), t);
+            let d = &mut defs[i];
+            d.template = t.text.clone();
+            d.template_line = t.first_line;
+            d.template_source = t.source.clone();
+        }
+        for (i, d) in defs.iter().enumerate() {
+            if !paired.contains_key(&d.name) && seen.get(&d.name) == Some(&i) {
+                errors.push(format!("{}:{}: {} {} has no template; add a `template {}` section", d.source, d.line, if d.fragment { "fragment" } else { "model" }, d.name, d.name));
+            }
+        }
+        // A field whose type names a model is a nested singleton: `ospf: Ospf?` / `ospf: Ospf`.
+        let is_model = |n: &str| seen.contains_key(n);
+        for d in defs.iter_mut() {
+            for f in d.fields.iter_mut() {
+                if matches!(f.kind, Kind::Opt | Kind::Scalar) && is_model(&f.type_spec) {
+                    if catalog.resolve(&f.type_spec).is_some() {
+                        errors.push(format!("{}:{}: field `{}`: `{}` names both a type and a model; rename one", d.source, f.line, f.name, f.type_spec));
+                    } else if f.default.is_some() {
+                        errors.push(format!("{}:{}: field `{}`: a nested model cannot have a default", d.source, f.line, f.name));
+                    } else {
+                        f.kind = Kind::Single { required: f.kind == Kind::Scalar };
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
+        let defs: Vec<&model::ModelDef> = defs.iter().filter(|d| !d.fragment).collect();
+        let index: IndexMap<&str, usize> = defs.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
         let is_keyed = |name: &str| index.get(name).map(|&i| defs[i].fields.iter().any(|f| f.kind == Kind::Key));
 
         let mut models: IndexMap<String, Compiled> = IndexMap::new();
@@ -214,13 +266,17 @@ impl Engine {
                         }
                         field_types.push(None);
                     }
+                    Kind::Single { .. } => {
+                        if !index.contains_key(f.type_spec.as_str()) { errs.push(format!("field `{}`: `{}` is a fragment; include it with << @{} >> instead", f.name, f.type_spec, f.type_spec)); }
+                        field_types.push(None);
+                    }
                     _ if f.type_spec.contains("{{") => match model::parse_struct_body(&f.type_spec).map_err(Error).and_then(|toks| struct_type(&catalog, &format!("{}.{}", d.name, f.name), &toks)) {
                         Ok(t) => field_types.push(Some(t)),
                         Err(e) => { errs.push(format!("field `{}`: {}", f.name, e.0)); field_types.push(None); }
                     },
                     _ => match catalog.resolve(&f.type_spec) {
                         Some(t) => field_types.push(Some(t)),
-                        None => { errs.push(format!("field `{}`: unknown type `{}` (known: {})", f.name, f.type_spec, catalog.names().join(", "))); field_types.push(None); }
+                        None => { errs.push(format!("field `{}`: {}", f.name, unknown_type(&catalog, &f.type_spec))); field_types.push(None); }
                     },
                 }
             }
@@ -243,28 +299,51 @@ impl Engine {
             }
         }
         if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
-        Ok(Engine { dialect, catalog, models })
+        // An unkeyed model used as a singleton is identified by its one top-level line.
+        for (d, m) in defs.iter().zip(models.values()) {
+            for (fi, f) in m.fields.iter().enumerate() {
+                if !matches!(f.kind, Kind::Single { .. }) { continue; }
+                if let CShape::Root { body } = &models[f.type_spec.as_str()].shape {
+                    if body.len() != 1 || matches!(body[0], Slot::Nested { .. }) {
+                        errors.push(format!("{}:{} model {}: field `{}`: {} has no key, so as a singleton it is identified by its header line; its template must have exactly one top-level line (not a << >> line), found {}", d.source, d.line, d.name, m.fields[fi].name, f.type_spec, body.len()));
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() { return Err(Error(errors.join("\n"))); }
+        Ok(Engine { dialect, catalog, models, warnings })
     }
 
-    /// Load every `*.ttp` file under `dir` (recursively). `fallback` names a builtin dialect
-    /// used when the files declare none.
+    /// Load every `*.nct` file under `dir` (recursively), except `*.test.nct` test files.
+    /// `*.ttp` files are still accepted, with a deprecation warning. `fallback` names a
+    /// builtin dialect used when the files declare none.
     pub fn load_dir(dir: &std::path::Path, fallback: Option<&str>) -> Result<Engine> {
         let mut paths = Vec::new();
         fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
             for e in std::fs::read_dir(p)? {
                 let e = e?.path();
-                if e.is_dir() { walk(&e, out)?; } else if e.extension().map(|x| x == "ttp").unwrap_or(false) { out.push(e); }
+                if e.is_dir() { walk(&e, out)?; } else if is_template_file(&e) { out.push(e); }
             }
             Ok(())
         }
         walk(dir, &mut paths).map_err(|e| Error(format!("{}: {e}", dir.display())))?;
         paths.sort();
+        Engine::load_files(&paths, fallback)
+    }
+
+    /// Load the given template files as one set.
+    pub fn load_files(paths: &[std::path::PathBuf], fallback: Option<&str>) -> Result<Engine> {
         let mut files = Vec::new();
         let mut errors = Vec::new();
-        for p in &paths {
+        for p in paths {
             let text = std::fs::read_to_string(p).map_err(|e| Error(format!("{}: {e}", p.display())))?;
             match model::parse(&p.display().to_string(), &text) {
-                Ok(f) => files.push(f),
+                Ok(mut f) => {
+                    if p.extension().map(|x| x == "ttp").unwrap_or(false) {
+                        f.warnings.insert(0, format!("{}: the `.ttp` extension is deprecated; rename the file to `.nct`", p.display()));
+                    }
+                    files.push(f)
+                }
                 Err(e) => errors.push(e.0),
             }
         }
@@ -284,6 +363,26 @@ impl Engine {
     }
 }
 
+/// A set's template files: `*.nct` (and deprecated `*.ttp`), but not `*.test.nct` test files.
+pub fn is_template_file(p: &std::path::Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    (name.ends_with(".nct") && !name.ends_with(".test.nct")) || name.ends_with(".ttp")
+}
+
+/// Types removed from the builtin catalog, with what to write instead.
+const REMOVED_TYPES: &[(&str, &str)] = &[
+    ("names", "list(string)"),
+    ("ints", "list(int)"),
+    ("intpair", "a struct with named parts, e.g. `{{ keepalive: int }} {{ hold: int }}`"),
+];
+
+fn unknown_type(catalog: &Catalog, spec: &str) -> String {
+    match REMOVED_TYPES.iter().find(|(n, _)| *n == spec) {
+        Some((_, instead)) => format!("type `{spec}` was removed; use {instead}"),
+        None => format!("unknown type `{spec}` (known: {})", catalog.names().join(", ")),
+    }
+}
+
 fn struct_type(catalog: &Catalog, name: &str, toks: &[model::StructTok]) -> Result<ScalarRef> {
     let mut out = Vec::new();
     for tok in toks {
@@ -294,7 +393,7 @@ fn struct_type(catalog: &Catalog, name: &str, toks: &[model::StructTok]) -> Resu
                     let alts = model::parse_alts(spec).map_err(Error)?;
                     Arc::new(UnionType { name: format!("{name}.{fname}"), alts: resolve_alts(catalog, &alts).map_err(Error)? })
                 } else {
-                    catalog.resolve(spec).ok_or_else(|| Error(format!("field `{fname}`: unknown type `{spec}`")))?
+                    catalog.resolve(spec).ok_or_else(|| Error(format!("field `{fname}`: {}", unknown_type(catalog, spec))))?
                 };
                 out.push(SToken::Field { name: fname.clone(), ty });
             }
@@ -311,6 +410,7 @@ fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<V
             model::Alt::Type(n) => match catalog.resolve(n) {
                 Some(ty) if ty.rest_of_line() => return Err(format!("`{n}` consumes the rest of the line and cannot be a union alternative")),
                 Some(ty) => resolved.push(Alt::Type(ty)),
+                None if REMOVED_TYPES.iter().any(|(r, _)| r == n) => return Err(unknown_type(catalog, n)),
                 None => return Err(format!("unknown type `{n}` (define it above, or quote it if it is a literal)")),
             },
         }
@@ -325,7 +425,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         Pattern { toks: toks.iter().filter_map(|t| match t {
             Tok::Lit(s) => Some(PTok::Lit(s.clone())),
             Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
-            Tok::Flag(_) => None,
+            Tok::Flag(_) | Tok::Nest(_) => None,
         }).collect() }
     };
     let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -345,7 +445,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
             Pattern { toks: toks.iter().filter_map(|t| match t {
                 Tok::Lit(s) => Some(PTok::Lit(s.clone())),
                 Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
-                Tok::Flag(_) => None, // zero-width: the line's presence is the value
+                Tok::Flag(_) | Tok::Nest(_) => None, // zero-width: the line's presence is the value
             }).collect() }
         };
         let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -370,7 +470,8 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         let toks = &l.toks[key_prefix_len..];
         let values: Vec<&FieldDef> = l.holes().into_iter().map(|h| &fields[fidx(h)]).filter(|f| f.kind != Kind::Key).collect();
         match values.as_slice() {
-            [f] if f.kind == Kind::Many => Ok(Slot::Many { field: fidx(&f.name), model: index[f.type_spec.as_str()] }),
+            [f] if f.kind == Kind::Many => Ok(Slot::Nested { field: fidx(&f.name), model: index[f.type_spec.as_str()], card: Card::Many }),
+            [f] if matches!(f.kind, Kind::Single { .. }) => Ok(Slot::Nested { field: fidx(&f.name), model: index[f.type_spec.as_str()], card: Card::Single { required: f.kind == Kind::Single { required: true } } }),
             [f] if f.kind == Kind::Flag => Ok(Slot::Flag {
                 lits: pattern(toks),
                 field: fidx(&f.name),
@@ -412,6 +513,8 @@ enum SlotState {
     Flag(Option<bool>),
     Container(Option<Vec<SlotState>>),
     Block { items: Vec<Record>, keys: HashSet<Vec<Value>> },
+    /// An unkeyed model used as a singleton: its body's states, and whether its line was seen.
+    Inline { states: Vec<SlotState>, hit: bool },
     Flat { groups: IndexMap<Vec<Value>, (Vec<(usize, Value)>, Vec<SlotState>)> },
 }
 
@@ -419,9 +522,10 @@ fn init_states(engine: &Engine, slots: &[Slot]) -> Vec<SlotState> {
     slots.iter().map(|s| match s {
         Slot::Line { .. } => SlotState::Line(None),
         Slot::Flag { .. } => SlotState::Flag(None),
-        Slot::Many { model, .. } => match &engine.models[*model].shape {
+        Slot::Nested { model, .. } => match &engine.models[*model].shape {
             CShape::Flat { .. } => SlotState::Flat { groups: IndexMap::new() },
-            _ => SlotState::Block { items: Vec::new(), keys: HashSet::new() },
+            CShape::Block { .. } => SlotState::Block { items: Vec::new(), keys: HashSet::new() },
+            CShape::Root { body } => SlotState::Inline { states: init_states(engine, body), hit: false },
         },
         Slot::Container { .. } => SlotState::Container(None),
     }).collect()
@@ -455,7 +559,7 @@ impl Engine {
             }
             _ => {
                 // A keyed model at top level: expect exactly one instance among the nodes.
-                let slots = [Slot::Many { field: 0, model: mi }];
+                let slots = [Slot::Nested { field: 0, model: mi, card: Card::Many }];
                 let mut states = init_states(self, &slots);
                 for n in nodes {
                     match self.claim(&slots[0], &mut states[0], n, &mut unmanaged) {
@@ -478,9 +582,9 @@ impl Engine {
 
     fn parse_body(&self, slots: &[Slot], ignores: &[Vec<String>], nodes: &[Node<'_>], unmanaged: &mut Vec<OwnedNode>) -> Result<Vec<SlotState>> {
         let mut states = init_states(self, slots);
-        // Flat collections contribute their `@ignore` prefixes to this level.
+        // Flat and inline nested models contribute their `@ignore` prefixes to this level.
         let extra: Vec<&Vec<String>> = slots.iter().filter_map(|s| match s {
-            Slot::Many { model, .. } => match self.models[*model].shape { CShape::Flat { .. } => Some(self.models[*model].ignores.iter()), _ => None },
+            Slot::Nested { model, .. } => match self.models[*model].shape { CShape::Flat { .. } | CShape::Root { .. } => Some(self.models[*model].ignores.iter()), _ => None },
             _ => None,
         }).flatten().collect();
         'nodes: for n in nodes {
@@ -556,12 +660,29 @@ impl Engine {
                     _ => Claim::NotMine,
                 }
             }
-            (Slot::Many { model, .. }, SlotState::Block { items, keys }) => {
+            (Slot::Nested { model, card, .. }, SlotState::Inline { states, hit }) => {
+                let m = &self.models[*model];
+                let CShape::Root { body } = &m.shape else { unreachable!() };
+                if *hit {
+                    // A second header line of a singleton: probe with fresh state for a clear message.
+                    let mut probe = init_states(self, body);
+                    return match self.claim(&body[0], &mut probe[0], n, &mut Vec::new()) {
+                        Claim::NotMine => Claim::NotMine,
+                        _ => Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name)),
+                    };
+                }
+                debug_assert!(*card != Card::Many);
+                let c = self.claim(&body[0], &mut states[0], n, unmanaged);
+                if matches!(c, Claim::Claimed) { *hit = true; }
+                c
+            }
+            (Slot::Nested { model, card, .. }, SlotState::Block { items, keys }) => {
                 let m = &self.models[*model];
                 let CShape::Block { header, key_fields, body } = &m.shape else { unreachable!() };
                 match header.parse_full(&n.tokens) {
                     PRes::Ok(vals, _) => {
                         let key: Vec<Value> = key_fields.iter().map(|f| vals.iter().find(|(i, _)| i == f).unwrap().1.clone()).collect();
+                        if *card != Card::Many && !items.is_empty() { return Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name)); }
                         if !keys.insert(key) { return Claim::Failed(format!("duplicate {}: `{}`", m.name, n.line_text())); }
                         let mut inner = Vec::new();
                         let states = match self.parse_body(body, &m.ignores, &n.children, &mut inner) {
@@ -581,7 +702,7 @@ impl Engine {
                     _ => Claim::NotMine, // a header that doesn't decode is simply not one of ours
                 }
             }
-            (Slot::Many { model, .. }, SlotState::Flat { groups }) => {
+            (Slot::Nested { model, card, .. }, SlotState::Flat { groups }) => {
                 let m = &self.models[*model];
                 let CShape::Flat { keys, lines } = &m.shape else { unreachable!() };
                 let (toks, negated) = self.strip_no(&n.tokens);
@@ -619,6 +740,9 @@ impl Engine {
                 }
                 let Some((i, vals)) = hit else { return Claim::NotMine };
                 let key: Vec<Value> = kvals.iter().map(|(_, v)| v.clone()).collect();
+                if *card != Card::Many && !groups.is_empty() && !groups.contains_key(&key) {
+                    return Claim::Failed(format!("duplicate {}: `{}` (a single {} is allowed here)", m.name, n.line_text(), m.name));
+                }
                 let entry = groups.entry(key).or_insert_with(|| (kvals.clone(), init_states(self, lines)));
                 match (&mut entry.1[i], vals) {
                     (SlotState::Line(st), Some(vals)) => {
@@ -646,7 +770,8 @@ impl Engine {
             }
             Slot::Flag { lits, .. } => if self.literal_no(lits) { lits.collides(&n.tokens) } else { lits.collides(self.strip_no(&n.tokens).0) },
             Slot::Container { lits, .. } => lits.collides(&n.tokens),
-            Slot::Many { model, .. } => match &self.models[*model].shape {
+            Slot::Nested { model, .. } => match &self.models[*model].shape {
+                CShape::Root { body } => self.collides(&body[0], n),
                 CShape::Flat { keys, lines } => {
                     let (toks, _) = self.strip_no(&n.tokens);
                     match keys.parse_prefix(toks) {
@@ -688,9 +813,22 @@ impl Engine {
                     let b = match st { Some(SlotState::Flag(Some(b))) => b, _ => *default };
                     vals[*field] = Some(Value::Bool(b));
                 }
-                (Slot::Many { field, model }, st) => {
+                (Slot::Nested { field, model, card: Card::Many }, st) => {
                     let items = match st { Some(st) => self.finish_many(&self.models[*model], st)?, None => Vec::new() };
                     vals[*field] = Some(Value::List(items.into_iter().map(Value::Record).collect()));
+                }
+                (Slot::Nested { field, model, card: Card::Single { required } }, st) => {
+                    let sub = &self.models[*model];
+                    let rec = match (st, &sub.shape) {
+                        (Some(SlotState::Inline { states, hit: true }), CShape::Root { body }) => Some(self.finish(sub, body, states)?),
+                        (Some(SlotState::Inline { .. }), _) | (None, _) => None,
+                        (Some(st), _) => self.finish_many(sub, st)?.pop(),
+                    };
+                    match rec {
+                        Some(r) => vals[*field] = Some(Value::Record(r)),
+                        None if *required => return Err(Error(format!("required {} (`{}`) is missing", sub.name, m.fields[*field].name))),
+                        None => {}
+                    }
                 }
                 (Slot::Container { body, .. }, st) => {
                     let inner = match st { Some(SlotState::Container(inner)) => inner, _ => None };
@@ -812,7 +950,17 @@ impl Engine {
                         out.push(OwnedNode { tokens: lits.render(&m.fields, rec)?, children, block: false });
                     }
                 }
-                Slot::Many { field, model } => {
+                Slot::Nested { field, model, card: Card::Single { required } } => {
+                    let name = &m.fields[*field].name;
+                    let sub = &self.models[*model];
+                    match rec.get(name) {
+                        None | Some(Value::Null) if *required => return Err(Error(format!("field `{name}` is missing (a required {})", sub.name))),
+                        None | Some(Value::Null) => {}
+                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r).map_err(|e| Error(format!("{}: {}", sub.name, e.0)))?),
+                        Some(v) => return Err(Error(format!("field `{name}`: expected a record ({}), got {v:?}", sub.name))),
+                    }
+                }
+                Slot::Nested { field, model, card: Card::Many } => {
                     let items = match rec.get(&m.fields[*field].name) {
                         None | Some(Value::Null) => continue,
                         Some(Value::List(l)) => l,
@@ -890,9 +1038,15 @@ impl Engine {
                             }
                         }
                     }
-                    Slot::Many { field, model } => {
+                    Slot::Nested { field, model, card: Card::Many } => {
                         out.push_str(&format!("{} (list of {})\n", m.fields[*field].name, e.models[*model].name));
                         out.push_str(&format!("  each     → {prefix}one {} block/group\n", e.models[*model].name));
+                    }
+                    Slot::Nested { field, model, card: Card::Single { required } } => {
+                        let sub = &e.models[*model];
+                        out.push_str(&format!("{} (single {}, {})\n", m.fields[*field].name, sub.name, if *required { "required" } else { "optional" }));
+                        out.push_str(&format!("  value    → {prefix}one {} block/group (a second is an error)\n", sub.name));
+                        if !*required { out.push_str("  missing  → (nothing written)\n"); }
                     }
                     Slot::Container { lits, body, .. } => {
                         walk(e, m, body, &format!("{prefix}{} > ", show(lits)), show, neg, out);

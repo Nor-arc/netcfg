@@ -1,12 +1,13 @@
 //! Bidirectional network-config templates.
 //!
-//! A `.ttp` file declares a model (typed fields) and a config-shaped template. The same
+//! A `.nct` file declares models (typed fields) and config-shaped templates. The same
 //! template parses a device's running config into a value and renders a value back to
 //! config. Matching is strict: a line that starts like a managed line but doesn't match is
 //! an error unless the template opts out with `@ignore`.
 
 pub mod dialect;
 pub mod engine;
+pub mod fmt;
 pub mod lexer;
 pub mod model;
 pub mod schema;

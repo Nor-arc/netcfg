@@ -12,16 +12,16 @@ model RouteMapEntry
   action: action
   seq: key int
   description: phrase?
-  matchPrefixLists: names?
+  matchPrefixLists: list(string)?
   matchAcl: string?
   matchCommunity: communityMatch?
   matchAsPath: string?
   setLocalPref: int?
   setMetric: int?
-  setCommunity: names?
+  setCommunity: list(string)?
   prependAsPath: list(prependItem)?
 
-template
+template RouteMapEntry
   route-map {{ name }} {{ action }} {{ seq }}
     description {{ description }}
     match ip address prefix-list {{ matchPrefixLists }}

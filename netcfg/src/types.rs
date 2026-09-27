@@ -220,59 +220,6 @@ impl Scalar for Phrase {
     fn schema(&self) -> serde_json::Value { json_str(None, "free text") }
 }
 
-/// One or more words to the end of the line, as a list.
-struct Names;
-impl Scalar for Names {
-    fn name(&self) -> &str { "names" }
-    fn rest_of_line(&self) -> bool { true }
-    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
-        if t.is_empty() { return Err("expected one or more names".into()); }
-        Ok((Value::List(t.iter().map(|w| Value::Str(w.to_string())).collect()), t.len()))
-    }
-    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        let l = v.as_list().ok_or_else(|| format!("expected a list of names, got {v:?}"))?;
-        if l.is_empty() { return Err("names must not be empty".into()); }
-        l.iter().map(|x| expect_str(x, "names").map(String::from)).collect()
-    }
-    fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "array", "items": {"type": "string"}, "minItems": 1}) }
-}
-
-/// One or more integers to the end of the line.
-struct Ints;
-impl Scalar for Ints {
-    fn name(&self) -> &str { "ints" }
-    fn rest_of_line(&self) -> bool { true }
-    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
-        if t.is_empty() { return Err("expected one or more integers".into()); }
-        let vs = t.iter().map(|w| w.parse::<i64>().map(Value::Int).map_err(|_| format!("'{w}' is not an integer"))).collect::<Result<Vec<_>, _>>()?;
-        Ok((Value::List(vs), t.len()))
-    }
-    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        let l = v.as_list().ok_or_else(|| format!("expected a list of integers, got {v:?}"))?;
-        l.iter().map(|x| match x { Value::Int(i) => Ok(i.to_string()), _ => Err(format!("{x:?} is not an integer")) }).collect()
-    }
-    fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "array", "items": {"type": "integer"}, "minItems": 1}) }
-}
-
-/// Exactly two integers, e.g. `timers 10 30`, as a two-element list.
-struct IntPair;
-impl Scalar for IntPair {
-    fn name(&self) -> &str { "intpair" }
-    fn parse(&self, t: &[&str]) -> Result<(Value, usize), String> {
-        if t.len() < 2 { return Err("expected two integers".into()); }
-        let a: i64 = t[0].parse().map_err(|_| format!("'{}' is not an integer", t[0]))?;
-        let b: i64 = t[1].parse().map_err(|_| format!("'{}' is not an integer", t[1]))?;
-        Ok((Value::List(vec![Value::Int(a), Value::Int(b)]), 2))
-    }
-    fn encode(&self, v: &Value) -> Result<Vec<String>, String> {
-        match v.as_list() {
-            Some([Value::Int(a), Value::Int(b)]) => Ok(vec![a.to_string(), b.to_string()]),
-            _ => Err(format!("expected [int, int], got {v:?}")),
-        }
-    }
-    fn schema(&self) -> serde_json::Value { serde_json::json!({"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}) }
-}
-
 /// A user-defined type: one token matching a regex (`type vrf = /[A-Z0-9_-]+/`).
 pub struct RegexType { pub name: String, pub source: String, pub re: Regex }
 impl Scalar for RegexType {
@@ -456,9 +403,6 @@ impl Catalog {
         c.add(Arc::new(UnionType { name: "prefix".into(), alts: vec![Alt::Type(Arc::new(Cidr { masked: masked_cidr })), Alt::Type(Arc::new(Ipv6Cidr))] }));
         c.add(Arc::new(Asn));
         c.add(Arc::new(Phrase));
-        c.add(Arc::new(Names));
-        c.add(Arc::new(Ints));
-        c.add(Arc::new(IntPair));
         Ok(c)
     }
     pub fn add(&mut self, t: ScalarRef) { self.types.insert(t.name().to_string(), t); }

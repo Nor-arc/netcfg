@@ -1,7 +1,7 @@
-//! The `.ttp` file format: type declarations, model declarations, and template text.
+//! The `.nct` file format: dialect, type, model and fragment declarations, and templates.
 //!
 //! ```text
-//! type action = permit | deny
+//! type action = "permit" | "deny"
 //! type vrf = /[A-Z0-9_-]{1,32}/
 //!
 //! model Interface
@@ -11,13 +11,16 @@
 //!   shutdown: flag
 //!   subinterfaces: [Subinterface]
 //!
-//! template
+//! template Interface
 //!   interface {{ name }}
 //!    description {{ description }}
 //!    mtu {{ mtu }}
 //!    shutdown [[ shutdown ]]
-//!    {{ subinterfaces }}
+//!    << subinterfaces >>
 //! ```
+//!
+//! A `template NAME` section names its model; it may live anywhere in the set. Pairing is
+//! resolved when the set is built (`Engine::build`), not here.
 
 use crate::{Error, Result};
 
@@ -31,15 +34,24 @@ pub enum Kind {
     Opt,
     /// `flag`: presence of a literal line.
     Flag,
-    /// `[Model]`: a keyed collection.
+    /// `[Model]`: a collection of blocks/groups.
     Many,
+    /// `Model` / `Model?`: at most one block/group of a nested model.
+    Single { required: bool },
+}
+
+impl Kind {
+    /// Bound with `<< >>`: a nested model rather than tokens on a line.
+    pub fn is_nested(self) -> bool {
+        matches!(self, Kind::Many | Kind::Single { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FieldDef {
     pub name: String,
     pub kind: Kind,
-    /// Scalar type spec (`ipv4`, `int(1..10)`) or the element model name for `Many`.
+    /// Scalar type spec (`ipv4`, `int(1..10)`) or the nested model name for `Many`/`Single`.
     pub type_spec: String,
     /// Default as written in the file (config tokens, or `true`/`false` for flags).
     pub default: Option<Vec<String>>,
@@ -81,9 +93,24 @@ pub struct ModelDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
     /// Template text, dedented, with original line numbers preserved via `template_line`.
+    /// Filled in when the set is built and the `template NAME` section is found.
     pub template: String,
-    /// Line number in the source file where the template text starts.
+    /// Line number in the template's source file where the template text starts.
     pub template_line: usize,
+    /// The file holding the template (may differ from `source`).
+    pub template_source: String,
+    pub source: String,
+    pub line: usize,
+    /// Declared with `fragment` rather than `model`: spliced into models with `<< @Name >>`.
+    pub fragment: bool,
+}
+
+/// A `template NAME` section: config-shaped text for the model (or fragment) `NAME`.
+#[derive(Debug, Clone)]
+pub struct TemplateDef {
+    pub model: String,
+    pub text: String,
+    pub first_line: usize,
     pub source: String,
     pub line: usize,
 }
@@ -100,157 +127,159 @@ pub struct DialectDef {
 pub struct File {
     pub types: Vec<TypeDef>,
     pub models: Vec<ModelDef>,
+    pub templates: Vec<TemplateDef>,
     pub dialect: Option<DialectDef>,
+    /// Deprecations and other non-fatal notes, each naming file and line.
+    pub warnings: Vec<String>,
 }
 
-fn is_ident(s: &str) -> bool {
+pub fn is_ident(s: &str) -> bool {
     let mut cs = s.chars();
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Parse one `.ttp` file. `source` names it in error messages.
+/// Dedent template lines, keeping blank lines so line numbers map 1:1 to the file.
+fn template_text(lines: &[(usize, &str)]) -> String {
+    let min_indent = lines.iter().filter(|(_, l)| !l.trim().is_empty())
+        .map(|(_, l)| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let mut text = String::new();
+    for (_, l) in lines {
+        if !l.trim().is_empty() { text.push_str(&l[min_indent.min(l.len() - l.trim_start().len())..]); }
+        text.push('\n');
+    }
+    text
+}
+
+enum Section<'a> {
+    None,
+    Dialect(DialectDef),
+    Model(ModelDef),
+    Template(TemplateDef, Vec<(usize, &'a str)>),
+}
+
+/// Parse one `.nct` file. `source` names it in error messages.
 pub fn parse(source: &str, text: &str) -> Result<File> {
     let mut file = File::default();
     let mut errors: Vec<String> = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
     let err = |errors: &mut Vec<String>, ln: usize, msg: String| errors.push(format!("{source}:{ln}: {msg}"));
+    let mut section = Section::None;
+    // The most recent model/fragment in this file, for the deprecated bare `template`.
+    let mut last_model: Option<String> = None;
 
-    // A model under construction: fields collected, template pending.
-    let mut current: Option<ModelDef> = None;
-    let mut in_dialect: Option<DialectDef> = None;
-    let mut in_template = false;
-    let mut template_lines: Vec<(usize, &str)> = Vec::new();
-
-    fn finish(current: &mut Option<ModelDef>, template_lines: &mut Vec<(usize, &str)>, file: &mut File, errors: &mut Vec<String>, source: &str) {
-        if let Some(mut m) = current.take() {
-            let min_indent = template_lines.iter().filter(|(_, l)| !l.trim().is_empty())
-                .map(|(_, l)| l.len() - l.trim_start().len()).min().unwrap_or(0);
-            // Keep blank lines so line numbers inside the template map 1:1 to the file.
-            let mut text = String::new();
-            for (_, l) in template_lines.iter() {
-                if !l.trim().is_empty() { text.push_str(&l[min_indent.min(l.len() - l.trim_start().len())..]); }
-                text.push('\n');
+    fn close(section: &mut Section<'_>, file: &mut File, errors: &mut Vec<String>, source: &str) {
+        match std::mem::replace(section, Section::None) {
+            Section::None => {}
+            Section::Dialect(d) => {
+                if file.dialect.is_some() { errors.push(format!("{source}:{}: only one `dialect` section per file", d.line)); }
+                file.dialect = Some(d);
             }
-            if text.trim().is_empty() {
-                errors.push(format!("{source}:{}: model {} has no template", m.line, m.name));
+            Section::Model(m) => file.models.push(m),
+            Section::Template(mut t, lines) => {
+                t.text = template_text(&lines);
+                t.first_line = lines.first().map(|(ln, _)| *ln).unwrap_or(t.line + 1);
+                if t.text.trim().is_empty() { errors.push(format!("{source}:{}: template {} is empty", t.line, t.model)); }
+                file.templates.push(t);
             }
-            m.template = text;
-            m.template_line = template_lines.first().map(|(ln, _)| *ln).unwrap_or(m.line);
-            file.models.push(m);
         }
-        template_lines.clear();
     }
 
-    while i < lines.len() {
+    for (i, raw) in text.lines().enumerate() {
         let ln = i + 1;
-        let raw = lines[i];
-        i += 1;
         let indented = raw.starts_with(' ') || raw.starts_with('\t');
         let line = raw.trim_end();
 
-        if in_template {
+        if let Section::Template(_, lines) = &mut section {
             if indented || line.trim().is_empty() {
-                template_lines.push((ln, line));
+                lines.push((ln, line));
                 continue;
             }
-            in_template = false;
-            finish(&mut current, &mut template_lines, &mut file, &mut errors, source);
         }
-
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
         if indented {
-            if let Some(d) = in_dialect.as_mut() {
-                match t.split_once(':') {
+            match &mut section {
+                Section::Dialect(d) => match t.split_once(':') {
                     Some((k, v)) => d.props.push((k.trim().to_string(), v.trim().to_string(), ln)),
                     None => err(&mut errors, ln, "expected `key: value` in the dialect section".into()),
-                }
-                continue;
-            }
-        } else if let Some(d) = in_dialect.take() {
-            if file.dialect.is_some() { err(&mut errors, d.line, "only one `dialect` section per file".into()); }
-            file.dialect = Some(d);
-        }
-        if !indented {
-            let mut words = t.splitn(2, ' ');
-            let kw = words.next().unwrap_or("");
-            let rest = words.next().unwrap_or("").trim();
-            match kw {
-                "type" => {
-                    let (name, body) = match rest.split_once('=') {
-                        Some((n, b)) => (n.trim(), b.trim()),
-                        None => { err(&mut errors, ln, "expected `type NAME = /regex/` or `type NAME = a | b`".into()); continue; }
-                    };
-                    if !is_ident(name) { err(&mut errors, ln, format!("`{name}` is not a valid type name")); continue; }
-                    let def = if body.contains("{{") {
-                        match parse_struct_body(body) {
-                            Ok(toks) => TypeBody::Struct(toks),
-                            Err(e) => { err(&mut errors, ln, format!("type `{name}`: {e}")); continue; }
-                        }
-                    } else if body.starts_with('/') && body.ends_with('/') && body.len() >= 2 {
-                        match regex::Regex::new(&body[1..body.len() - 1]) {
-                            Ok(_) => TypeBody::Regex(body[1..body.len() - 1].to_string()),
-                            Err(e) => { err(&mut errors, ln, format!("invalid regex for type `{name}`: {e}")); continue; }
-                        }
-                    } else {
-                        let mut alts = Vec::new();
-                        for part in body.split('|').map(str::trim).filter(|s| !s.is_empty()) {
-                            if let Some(lit) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                                alts.push(Alt::Lit(lit.to_string()));
-                            } else if is_ident(part) || part.starts_with("int(") || part.starts_with("list(") {
-                                alts.push(Alt::Type(part.to_string()));
-                            } else {
-                                err(&mut errors, ln, format!("type `{name}`: `{part}` is neither a type name nor a \"quoted\" literal"));
-                            }
-                        }
-                        if alts.is_empty() { err(&mut errors, ln, format!("type `{name}` needs at least one alternative")); continue; }
-                        TypeBody::Union(alts)
-                    };
-                    file.types.push(TypeDef { name: name.to_string(), def, line: ln });
-                }
-                "dialect" => {
-                    finish(&mut current, &mut template_lines, &mut file, &mut errors, source);
-                    if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid dialect name")); }
-                    in_dialect = Some(DialectDef { name: rest.to_string(), props: Vec::new(), line: ln });
-                }
-                "model" => {
-                    finish(&mut current, &mut template_lines, &mut file, &mut errors, source);
-                    if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid model name")); }
-                    current = Some(ModelDef { name: rest.to_string(), fields: Vec::new(), template: String::new(), template_line: ln, source: source.to_string(), line: ln });
-                }
-                "template" => {
-                    if current.is_none() { err(&mut errors, ln, "`template` must follow a `model` section".into()); continue; }
-                    if !rest.is_empty() { err(&mut errors, ln, "`template` takes no arguments; the text goes on the indented lines below".into()); }
-                    in_template = true;
-                }
-                other => err(&mut errors, ln, format!("unexpected `{other}`; expected `dialect`, `type`, `model` or `template`")),
+                },
+                Section::Model(m) => match parse_field(t, ln) {
+                    Ok(f) => {
+                        if m.fields.iter().any(|g| g.name == f.name) { err(&mut errors, ln, format!("duplicate field `{}`", f.name)); }
+                        m.fields.push(f);
+                    }
+                    Err(e) => err(&mut errors, ln, e.0),
+                },
+                _ => err(&mut errors, ln, "field declaration outside a `model` or `fragment` section".into()),
             }
             continue;
         }
-
-        // Indented: a field of the current model.
-        let Some(m) = current.as_mut() else {
-            err(&mut errors, ln, "field declaration outside a `model` section".into());
-            continue;
-        };
-        match parse_field(t, ln) {
-            Ok(f) => {
-                if m.fields.iter().any(|g| g.name == f.name) { err(&mut errors, ln, format!("duplicate field `{}`", f.name)); }
-                m.fields.push(f);
+        close(&mut section, &mut file, &mut errors, source);
+        let mut words = t.splitn(2, ' ');
+        let kw = words.next().unwrap_or("");
+        let rest = words.next().unwrap_or("").trim();
+        match kw {
+            "type" => match parse_type(rest) {
+                Ok((name, def)) => file.types.push(TypeDef { name, def, line: ln }),
+                Err(e) => err(&mut errors, ln, e),
+            },
+            "dialect" => {
+                if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid dialect name")); }
+                section = Section::Dialect(DialectDef { name: rest.to_string(), props: Vec::new(), line: ln });
             }
-            Err(e) => err(&mut errors, ln, e.0),
+            "model" | "fragment" => {
+                if !is_ident(rest) { err(&mut errors, ln, format!("`{rest}` is not a valid {kw} name")); }
+                last_model = Some(rest.to_string());
+                section = Section::Model(ModelDef {
+                    name: rest.to_string(), fields: Vec::new(), template: String::new(), template_line: ln,
+                    template_source: source.to_string(), source: source.to_string(), line: ln, fragment: kw == "fragment",
+                });
+            }
+            "template" => {
+                let name = if rest.is_empty() {
+                    match &last_model {
+                        Some(m) => {
+                            file.warnings.push(format!("{source}:{ln}: bare `template` is deprecated; write `template {m}` (`netcfg fmt` rewrites files)"));
+                            m.clone()
+                        }
+                        None => { err(&mut errors, ln, "`template` needs the name of its model: `template NAME`".into()); continue; }
+                    }
+                } else if is_ident(rest) {
+                    rest.to_string()
+                } else {
+                    err(&mut errors, ln, format!("`template {rest}`: expected `template NAME` naming a model; the text goes on the indented lines below"));
+                    continue;
+                };
+                section = Section::Template(TemplateDef { model: name, text: String::new(), first_line: ln + 1, source: source.to_string(), line: ln }, Vec::new());
+            }
+            other => err(&mut errors, ln, format!("unexpected `{other}`; expected `dialect`, `type`, `model`, `fragment` or `template`")),
         }
     }
-    finish(&mut current, &mut template_lines, &mut file, &mut errors, source);
-    if let Some(d) = in_dialect.take() {
-        if file.dialect.is_some() { err(&mut errors, d.line, "only one `dialect` section per file".into()); }
-        file.dialect = Some(d);
-    }
+    close(&mut section, &mut file, &mut errors, source);
 
     if errors.is_empty() { Ok(file) } else { Err(Error(errors.join("\n"))) }
+}
+
+/// `NAME = body` of a `type` line.
+fn parse_type(rest: &str) -> std::result::Result<(String, TypeBody), String> {
+    let (name, body) = match rest.split_once('=') {
+        Some((n, b)) => (n.trim(), b.trim()),
+        None => return Err("expected `type NAME = /regex/`, `type NAME = \"a\" | \"b\"` or `type NAME = {{ part: type }} ...`".into()),
+    };
+    if !is_ident(name) { return Err(format!("`{name}` is not a valid type name")); }
+    let def = if body.contains("{{") {
+        TypeBody::Struct(parse_struct_body(body).map_err(|e| format!("type `{name}`: {e}"))?)
+    } else if body.starts_with('/') && body.ends_with('/') && body.len() >= 2 {
+        let re = &body[1..body.len() - 1];
+        regex::Regex::new(re).map_err(|e| format!("invalid regex for type `{name}`: {e}"))?;
+        TypeBody::Regex(re.to_string())
+    } else {
+        let alts = parse_alts(body).map_err(|e| format!("type `{name}`: {e}"))?;
+        if alts.is_empty() { return Err(format!("type `{name}` needs at least one alternative")); }
+        TypeBody::Union(alts)
+    };
+    Ok((name.to_string(), def))
 }
 
 pub fn parse_struct_body(body: &str) -> std::result::Result<Vec<StructTok>, String> {
@@ -342,7 +371,7 @@ mod tests {
 
     #[test]
     fn parses_a_model() {
-        let f = parse("t.ttp", "type action = \"permit\" | \"deny\"\n\nmodel Rm\n  name: key string\n  action: action\n  seq: key int\n  desc: phrase?\n  shut: flag = true\n  kids: [Kid]\n\ntemplate\n  route-map {{ name }} {{ action }} {{ seq }}\n    description {{ desc }}\n").unwrap();
+        let f = parse("t.nct", "type action = \"permit\" | \"deny\"\n\nmodel Rm\n  name: key string\n  action: action\n  seq: key int\n  desc: phrase?\n  shut: flag = true\n  kids: [Kid]\n\ntemplate Rm\n  route-map {{ name }} {{ action }} {{ seq }}\n    description {{ desc }}\n").unwrap();
         assert_eq!(f.types.len(), 1);
         let m = &f.models[0];
         assert_eq!(m.fields.len(), 6);
@@ -350,9 +379,32 @@ mod tests {
         assert_eq!(m.fields[3].kind, Kind::Opt);
         assert_eq!(m.fields[4].default, Some(vec!["true".into()]));
         assert_eq!(m.fields[5].type_spec, "Kid");
-        assert!(m.template.starts_with("route-map"));
-        assert_eq!(m.template_line, 12);
-        let f = parse("d.ttp", "dialect iosxe\n  extends: ios\n  cidr: masked\n").unwrap();
+        let t = &f.templates[0];
+        assert_eq!(t.model, "Rm");
+        assert!(t.text.starts_with("route-map"));
+        assert_eq!(t.first_line, 12);
+        assert!(f.warnings.is_empty());
+        let f = parse("d.nct", "dialect iosxe\n  extends: ios\n  cidr: masked\n").unwrap();
         assert_eq!(f.dialect.as_ref().unwrap().props.len(), 2);
+    }
+
+    #[test]
+    fn templates_name_their_model_anywhere() {
+        let f = parse("t.nct", "template B\n  b {{ x }}\n\nmodel A\n  x: int\n\nmodel B\n  x: int\n\ntemplate A\n  a {{ x }}\n").unwrap();
+        assert_eq!(f.models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+        assert_eq!(f.templates.iter().map(|t| (t.model.as_str(), t.first_line)).collect::<Vec<_>>(), vec![("B", 2), ("A", 11)]);
+        let f = parse("t.nct", "fragment Common\n  mtu: int?\n\ntemplate Common\n  mtu {{ mtu }}\n").unwrap();
+        assert!(f.models[0].fragment);
+    }
+
+    #[test]
+    fn bare_template_is_deprecated() {
+        let f = parse("old.nct", "model A\n  x: int\n\ntemplate\n  a {{ x }}\n").unwrap();
+        assert_eq!(f.templates[0].model, "A");
+        assert_eq!(f.warnings, vec!["old.nct:4: bare `template` is deprecated; write `template A` (`netcfg fmt` rewrites files)"]);
+        let err = parse("t.nct", "template\n  a {{ x }}\n").unwrap_err();
+        assert!(err.0.contains("t.nct:1: `template` needs the name of its model"), "{err}");
+        let err = parse("t.nct", "model A\n  x: int\ntemplate A B\n  a\n").unwrap_err();
+        assert!(err.0.contains("t.nct:3: `template A B`"), "{err}");
     }
 }

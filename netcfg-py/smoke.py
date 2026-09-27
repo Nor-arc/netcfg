@@ -1,0 +1,52 @@
+"""Smoke test for the Python bindings. Run after installing the wheel:
+
+    cd netcfg-py && maturin build --release && pip install ../target/wheels/netcfg-*.whl
+    python smoke.py
+"""
+import pathlib
+import warnings
+
+import netcfg
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+T = ROOT / "templates"
+
+print("netcfg", netcfg.__version__, netcfg.__build__)
+
+# Parse / render round trip on the NX-OS example set.
+e = netcfg.Engine(str(T / "nxos"))
+assert e.dialect == "nxos", e.dialect
+cfg = """hostname leaf1
+router bgp 65000
+  router-id 10.0.0.1
+  neighbor 10.1.0.1
+    remote-as 65001
+    timers 10 30
+    bfd
+"""
+r = e.parse("Device", cfg)
+nbr = r.value["bgp"][0]["neighbors"][0]
+assert nbr["timers"] == {"keepalive": 10, "hold": 30}, nbr
+assert r.unmanaged == ["router bgp 65000 > neighbor 10.1.0.1 > bfd"], r.unmanaged
+assert e.render("Device", r.value) == cfg.replace("    bfd\n", "")
+assert e.schema("Device")["$defs"]["Neighbor"]["properties"]["timers"]["anyOf"][0]["type"] == "object"
+try:
+    e.parse("Device", cfg.replace("remote-as 65001", "remote-as abc"))
+    raise AssertionError("expected ValueError")
+except ValueError as err:
+    assert "remote-as abc" in str(err)
+
+# Singletons and the deprecated bare template.
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    s = netcfg.Engine.from_text(
+        "model Ntp\n  server: ipv4\n\ntemplate\n  ntp server {{ server }}\n\n"
+        "model D\n  ntp: Ntp?\n\ntemplate D\n  << ntp >>\n",
+        "nxos",
+    )
+assert any(issubclass(w.category, DeprecationWarning) and "bare `template`" in str(w.message) for w in caught), caught
+assert s.warnings and "template Ntp" in s.warnings[0]
+assert s.parse("D", "ntp server 10.0.0.1\n").value == {"ntp": {"server": "10.0.0.1"}}
+assert s.render("D", {}) == ""
+
+print("ok")

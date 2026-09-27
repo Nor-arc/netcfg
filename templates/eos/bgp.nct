@@ -9,7 +9,7 @@ model EosNeighbor
   description: phrase?
   updateSource: string?
   ebgpMultihop: int(2..255)?
-  timers: intpair?
+  timers: {{ keepalive: int }} {{ hold: int }}?
   routeMapIn: string?
   routeMapOut: string?
   # A value with trailing modifiers is a struct type: its own little template, yielding a
@@ -19,7 +19,7 @@ model EosNeighbor
   nextHopSelf: flag
   shutdown: flag
 
-template
+template EosNeighbor
   neighbor {{ peer }} remote-as {{ remoteAs }}
   neighbor {{ peer }} peer group {{ peerGroup }}
   neighbor {{ peer }} description {{ description }}
@@ -39,17 +39,17 @@ model EosBgp
   routerId: ipv4?
   neighbors: [EosNeighbor]
 
-template
+template EosBgp
   router bgp {{ asn }}
     router-id {{ routerId }}
-    {{ neighbors }}
+    << neighbors >>
 
 model EosDevice
   hostname: string
   routeMaps: [RouteMapEntry]
   bgp: [EosBgp]
 
-template
+template EosDevice
   hostname {{ hostname }}
-  {{ routeMaps }}
-  {{ bgp }}
+  << routeMaps >>
+  << bgp >>
