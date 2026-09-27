@@ -114,6 +114,11 @@ impl Engine {
         py.allow_threads(|| self.core.render(model, &v)).map_err(|e| PyValueError::new_err(e.0))
     }
 
+    /// How every field of a model is spelled in config (the `netcfg explain` table).
+    fn explain(&self, model: &str) -> PyResult<String> {
+        self.core.explain(model).map_err(|e| PyValueError::new_err(e.0))
+    }
+
     /// JSON Schema (as a dict) for a model's data.
     fn schema(&self, py: Python<'_>, model: &str) -> PyResult<PyObject> {
         let s = self.core.schema(model).map_err(|e| PyValueError::new_err(e.0))?;
@@ -125,5 +130,7 @@ impl Engine {
 fn netcfg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Parsed>()?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__build__", concat!(env!("CARGO_PKG_VERSION"), "+", env!("NETCFG_BUILD")))?;
     Ok(())
 }

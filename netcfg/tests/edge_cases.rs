@@ -275,7 +275,7 @@ fn struct_types() {
     s.parses_to(&add("1200 warning-only"), |j| j["bgp"][0]["neighbors"][0]["maximumRoutes"] == serde_json::json!({"limit": 1200, "action": "warning-only"}));
     // `loudly` matches no alternative, the empty one is taken, and the leftover token makes the line unrepresentable.
     s.fails(&add("1200 loudly"), "maximum-routes 1200 loudly`: starts like a managed line");
-    s.fails(&add("many"), "maxRoutes.limit: 'many' is not an integer");
+    s.fails(&add("many"), "maximumRoutes.limit: 'many' is not an integer");
     s.fails(&add("warning-only 1200"), "warning-only");
     s.round_trip(&add("1200 warning-limit"));
     assert!(s.e.render("EosDevice", &s.e.parse("EosDevice", &add("1200 warning-only")).unwrap().value).unwrap().contains("neighbor 10.1.0.1 maximum-routes 1200 warning-only\n"));
@@ -303,7 +303,7 @@ fn struct_types() {
 #[test]
 fn negation_forms() {
     let t = "model Interface\n  name: key string\n  switchport: flag = true\n  address: cidr?\n  shutdown: flag\n\nmodel Dev\n  ifaces: [Interface]\n\ntemplate\n  {{ ifaces }}\n";
-    let t = t.replace("model Dev", "template\n  interface {{ name }}\n   switchport {{ switchport }}\n   ip address {{ address }}\n   shutdown {{ shutdown }}\n\nmodel Dev");
+    let t = t.replace("model Dev", "template\n  interface {{ name }}\n   switchport [[ switchport ]]\n   ip address {{ address }}\n   shutdown [[ shutdown ]]\n\nmodel Dev");
     let e = Engine::from_text("t", &t, Some("ios")).unwrap();
     let cfg = "interface Gi0/1\n no switchport\n ip address 10.0.0.1 255.255.255.0\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\ninterface Gi0/3\n no ip address\n no shutdown\n!\nend\n";
     let p = e.parse("Dev", cfg).unwrap();
@@ -330,7 +330,7 @@ fn negation_forms() {
 #[test]
 fn explicit_negated_flag_spelling_and_explain() {
     let t = "model I\n  name: key string\n  shutdown: flag = true\n\nmodel D\n  ifaces: [I]\n\ntemplate\n  {{ ifaces }}\n";
-    let t = t.replace("model D", "template\n  interface {{ name }}\n   shutdown {{ shutdown }}\n   no shutdown {{ shutdown }}\n\nmodel D");
+    let t = t.replace("model D", "template\n  interface {{ name }}\n   shutdown [[ shutdown ]]\n   no shutdown [[ shutdown ]]\n\nmodel D");
     let e = Engine::from_text("t", &t, Some("ios")).unwrap();
     let p = e.parse("D", "interface Gi0/1\n no shutdown\ninterface Gi0/2\n shutdown\ninterface Gi0/3\n").unwrap();
     let j = p.value.to_json();
@@ -341,7 +341,7 @@ fn explicit_negated_flag_spelling_and_explain() {
     let x = e.explain("I").unwrap();
     assert!(x.contains("shutdown (flag, default true)\n  true     → shutdown  (nothing written: default)\n  false    → no shutdown\n"), "{x}");
     // A negated line without its positive partner is an error.
-    let bad = "model I\n  name: key string\n  shutdown: flag\n\ntemplate\n  interface {{ name }}\n   no shutdown {{ shutdown }}\n";
+    let bad = "model I\n  name: key string\n  shutdown: flag\n\ntemplate\n  interface {{ name }}\n   no shutdown [[ shutdown ]]\n";
     let err = Engine::from_text("t", bad, Some("ios")).unwrap_err();
     assert!(err.0.contains("needs a normal line for this negated flag spelling"), "{err}");
 }
@@ -380,5 +380,61 @@ fn implicit_negated_absent_form() {
     let p = j.parse("D", "interface Gi0/1 { no ip address; }").unwrap();
     assert_eq!(p.unmanaged_paths(), vec!["interface Gi0/1 > no ip address"]);
     let x = e.explain("N").unwrap();
-    assert!(x.contains("  null     → neighbor <peer:ip> no description\n"), "{x}");
+    assert!(x.contains("  null     → no neighbor <peer:ip> description\n"), "{x}");
+}
+
+#[test]
+fn struct_with_optional_leading_modifier() {
+    let t = "type communityMatch = {{ mode: \"or-results\" | \"\" }} {{ names: list(string) }}\n\nmodel Rm\n  name: key string\n  seq: key int\n  matchCommunity: communityMatch?\n\ntemplate\n  route-map {{ name }} permit {{ seq }}\n    match community {{ matchCommunity }}\n";
+    let e = Engine::from_text("t", t, Some("nxos")).unwrap();
+    let parse = |line: &str| e.parse("Rm", &format!("route-map RM permit 10\n  match community {line}\n")).unwrap().value.to_json()["matchCommunity"].clone();
+    assert_eq!(parse("CL-A"), serde_json::json!({"names": ["CL-A"]}));
+    assert_eq!(parse("CL-A CL-B"), serde_json::json!({"names": ["CL-A", "CL-B"]}));
+    assert_eq!(parse("or-results CL-A CL-B"), serde_json::json!({"mode": "or-results", "names": ["CL-A", "CL-B"]}));
+    let v = Value::from_json(&serde_json::json!({"name": "RM", "seq": 10, "matchCommunity": {"mode": "or-results", "names": ["X", "Y"]}}));
+    assert_eq!(e.render("Rm", &v).unwrap(), "route-map RM permit 10\n  match community or-results X Y\n");
+    let v = Value::from_json(&serde_json::json!({"name": "RM", "seq": 10, "matchCommunity": {"names": ["X"]}}));
+    assert_eq!(e.render("Rm", &v).unwrap(), "route-map RM permit 10\n  match community X\n");
+    // `or-results` alone has no names: the list requires at least one.
+    let err = e.parse("Rm", "route-map RM permit 10\n  match community or-results\n").unwrap_err();
+    assert!(err.0.contains("communityMatch.names: expected one or more string"), "{err}");
+}
+
+#[test]
+fn negated_value_line_is_not_dropped() {
+    let s = Suite::new("eos", "EosDevice", EO);
+    // Top-level keyed parse is as strict as nested parse.
+    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyAction: string?\n\ntemplate\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy {{ prePolicyAction }}\n";
+    let e = Engine::from_text("t", t, Some("eos")).unwrap();
+    let err = e.parse("N", "neighbor 1.1.1.1 remote-as 65431\nno neighbor 1.1.1.1 rib-in pre-policy retain\n").unwrap_err();
+    assert!(err.0.contains("no neighbor 1.1.1.1 rib-in pre-policy retain`: starts like a managed line") && err.0.contains("model it as a flag"), "{err}");
+    let _ = s;
+    // Modelled as a flag with the device default, it round-trips.
+    let t = "model N\n  peer: key ip\n  remoteAs: asn?\n  prePolicyRetainAll: flag\n  prePolicyRetain: flag = true\n\ntemplate\n  neighbor {{ peer }} remote-as {{ remoteAs }}\n  neighbor {{ peer }} rib-in pre-policy retain all [[ prePolicyRetainAll ]]\n  neighbor {{ peer }} rib-in pre-policy retain [[ prePolicyRetain ]]\n";
+    let e = Engine::from_text("t", t, Some("eos")).unwrap();
+    let cfg = "neighbor 1.1.1.1 remote-as 65431\nno neighbor 1.1.1.1 rib-in pre-policy retain\nneighbor 1.1.1.2 remote-as 65432\nneighbor 1.1.1.2 rib-in pre-policy retain all\n";
+    let p = e.parse("N", &cfg.replace("neighbor 1.1.1.2 remote-as 65432\nneighbor 1.1.1.2 rib-in pre-policy retain all\n", "")).unwrap();
+    assert_eq!(p.value.to_json(), serde_json::json!({"peer": "1.1.1.1", "remoteAs": 65431, "prePolicyRetainAll": false, "prePolicyRetain": false}));
+    assert_eq!(e.render("N", &p.value).unwrap(), "neighbor 1.1.1.1 remote-as 65431\nno neighbor 1.1.1.1 rib-in pre-policy retain\n");
+    let p = e.parse("N", "neighbor 1.1.1.2 remote-as 65432\nneighbor 1.1.1.2 rib-in pre-policy retain all\n").unwrap();
+    assert_eq!(p.value.to_json()["prePolicyRetainAll"], true);
+}
+
+#[test]
+fn flag_marker_and_anonymous_struct() {
+    // {{ }} on a flag and [[ ]] on a value are both rejected, with the fix in the message.
+    let bad = "model I\n  name: key string\n  shutdown: flag\n  mtu: int?\n\ntemplate\n  interface {{ name }}\n   shutdown {{ shutdown }}\n   mtu [[ mtu ]]\n";
+    let err = Engine::from_text("t", bad, Some("ios")).unwrap_err().0;
+    assert!(err.contains("`shutdown` is a flag: write it as [[ shutdown ]]"), "{err}");
+    assert!(err.contains("`mtu` is not a flag: [[ ]] is for flags"), "{err}");
+    // Anonymous struct type on a field, optional.
+    let t = "model N\n  peer: key ip\n  maximumRoutes: {{ limit: int }} {{ action: \"warning-only\" | \"\" }}?\n  timers: {{ keepalive: int }} {{ hold: int }}\n\ntemplate\n  neighbor {{ peer }}\n    maximum-routes {{ maximumRoutes }}\n    timers {{ timers }}\n";
+    let e = Engine::from_text("t", t, Some("nxos")).unwrap();
+    let p = e.parse("N", "neighbor 10.0.0.1\n  maximum-routes 1200 warning-only\n  timers 10 30\n").unwrap();
+    assert_eq!(p.value.to_json(), serde_json::json!({"peer": "10.0.0.1", "maximumRoutes": {"limit": 1200, "action": "warning-only"}, "timers": {"keepalive": 10, "hold": 30}}));
+    assert_eq!(e.render("N", &p.value).unwrap(), "neighbor 10.0.0.1\n  maximum-routes 1200 warning-only\n  timers 10 30\n");
+    let err = e.parse("N", "neighbor 10.0.0.1\n  timers 10\n").unwrap_err();
+    assert!(err.0.contains("N.timers.hold"), "{err}");
+    // A required anonymous struct is required.
+    assert!(e.parse("N", "neighbor 10.0.0.1\n").unwrap_err().0.contains("required line `timers"));
 }

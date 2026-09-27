@@ -18,13 +18,13 @@ model NeighborAf
 
 template
   address-family {{ afi }} {{ safi }}
-    send-community {{ sendCommunity }}
-    send-community extended {{ sendCommunityExtended }}
+    send-community [[ sendCommunity ]]
+    send-community extended [[ sendCommunityExtended ]]
     route-map {{ routeMapIn }} in
     route-map {{ routeMapOut }} out
     maximum-prefix {{ maximumPrefix }}
-    next-hop-self {{ nextHopSelf }}
-    soft-reconfiguration inbound {{ softReconfigInbound }}
+    next-hop-self [[ nextHopSelf ]]
+    soft-reconfiguration inbound [[ softReconfigInbound ]]
 
 model Neighbor
   peer: key ip
@@ -45,7 +45,7 @@ template
     update-source {{ updateSource }}
     ebgp-multihop {{ ebgpMultihop }}
     timers {{ timers }}
-    shutdown {{ shutdown }}
+    shutdown [[ shutdown ]]
     {{ addressFamilies }}
 
 model PeerTemplate
@@ -72,7 +72,7 @@ model Bgp
 template
   router bgp {{ asn }}
     router-id {{ routerId }}
-    log-neighbor-changes {{ logNeighborChanges }}
+    log-neighbor-changes [[ logNeighborChanges ]]
     {{ peerTemplates }}
     {{ neighbors }}
 

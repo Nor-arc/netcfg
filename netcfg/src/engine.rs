@@ -184,28 +184,10 @@ impl Engine {
                     Ok(resolved) => catalog.add(Arc::new(UnionType { name: t.name.clone(), alts: resolved })),
                     Err(e) => errors.push(format!("type `{}` (line {}): {e}", t.name, t.line)),
                 },
-                TypeBody::Struct(toks) => {
-                    let mut out = Vec::new();
-                    let mut ok = true;
-                    for tok in toks {
-                        match tok {
-                            model::StructTok::Lit(l) => out.push(SToken::Lit(l.clone())),
-                            model::StructTok::Field { name, spec } => {
-                                let ty: Result<ScalarRef> = if spec.contains('|') {
-                                    model::parse_alts(spec).map_err(Error).and_then(|alts| resolve_alts(&catalog, &alts).map_err(Error))
-                                        .map(|alts| Arc::new(UnionType { name: format!("{}.{name}", t.name), alts }) as ScalarRef)
-                                } else {
-                                    catalog.resolve(spec).ok_or_else(|| Error(format!("unknown type `{spec}`")))
-                                };
-                                match ty {
-                                    Ok(ty) => out.push(SToken::Field { name: name.clone(), ty }),
-                                    Err(e) => { errors.push(format!("type `{}` (line {}): field `{name}`: {}", t.name, t.line, e.0)); ok = false; }
-                                }
-                            }
-                        }
-                    }
-                    if ok { catalog.add(Arc::new(StructType { name: t.name.clone(), toks: out })); }
-                }
+                TypeBody::Struct(toks) => match struct_type(&catalog, &t.name, toks) {
+                    Ok(st) => catalog.add(st),
+                    Err(e) => errors.push(format!("type `{}` (line {}): {}", t.name, t.line, e.0)),
+                },
             }
         }
         let defs: Vec<&model::ModelDef> = files.iter().flat_map(|f| f.models.iter()).collect();
@@ -232,6 +214,10 @@ impl Engine {
                         }
                         field_types.push(None);
                     }
+                    _ if f.type_spec.contains("{{") => match model::parse_struct_body(&f.type_spec).map_err(Error).and_then(|toks| struct_type(&catalog, &format!("{}.{}", d.name, f.name), &toks)) {
+                        Ok(t) => field_types.push(Some(t)),
+                        Err(e) => { errs.push(format!("field `{}`: {}", f.name, e.0)); field_types.push(None); }
+                    },
                     _ => match catalog.resolve(&f.type_spec) {
                         Some(t) => field_types.push(Some(t)),
                         None => { errs.push(format!("field `{}`: unknown type `{}` (known: {})", f.name, f.type_spec, catalog.names().join(", "))); field_types.push(None); }
@@ -298,6 +284,25 @@ impl Engine {
     }
 }
 
+fn struct_type(catalog: &Catalog, name: &str, toks: &[model::StructTok]) -> Result<ScalarRef> {
+    let mut out = Vec::new();
+    for tok in toks {
+        match tok {
+            model::StructTok::Lit(l) => out.push(SToken::Lit(l.clone())),
+            model::StructTok::Field { name: fname, spec } => {
+                let ty: ScalarRef = if spec.contains('|') {
+                    let alts = model::parse_alts(spec).map_err(Error)?;
+                    Arc::new(UnionType { name: format!("{name}.{fname}"), alts: resolve_alts(catalog, &alts).map_err(Error)? })
+                } else {
+                    catalog.resolve(spec).ok_or_else(|| Error(format!("field `{fname}`: unknown type `{spec}`")))?
+                };
+                out.push(SToken::Field { name: fname.clone(), ty });
+            }
+        }
+    }
+    Ok(Arc::new(StructType { name: name.to_string(), toks: out }))
+}
+
 fn resolve_alts(catalog: &Catalog, alts: &[model::Alt]) -> std::result::Result<Vec<Alt>, String> {
     let mut resolved = Vec::new();
     for a in alts {
@@ -317,9 +322,10 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
     let fields = &d.fields;
     let fidx = |n: &str| fields.iter().position(|f| f.name == n).unwrap();
     let pattern = |toks: &[Tok]| -> Pattern {
-        Pattern { toks: toks.iter().map(|t| match t {
-            Tok::Lit(s) => PTok::Lit(s.clone()),
-            Tok::Hole(n) => { let i = fidx(n); PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key } }
+        Pattern { toks: toks.iter().filter_map(|t| match t {
+            Tok::Lit(s) => Some(PTok::Lit(s.clone())),
+            Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
+            Tok::Flag(_) => None,
         }).collect() }
     };
     let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -336,9 +342,10 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
     fn slot_of(l: &TLine, _siblings: &[TLine], key_prefix_len: usize, fields: &[FieldDef], field_types: &[Option<ScalarRef>], index: &IndexMap<&str, usize>, negation: Option<&str>) -> Result<Slot> {
         let fidx = |n: &str| fields.iter().position(|f| f.name == n).unwrap();
         let pattern = |toks: &[Tok]| -> Pattern {
-            Pattern { toks: toks.iter().map(|t| match t {
-                Tok::Lit(s) => PTok::Lit(s.clone()),
-                Tok::Hole(n) => { let i = fidx(n); PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key } }
+            Pattern { toks: toks.iter().filter_map(|t| match t {
+                Tok::Lit(s) => Some(PTok::Lit(s.clone())),
+                Tok::Hole(n) => { let i = fidx(n); Some(PTok::Hole { field: i, ty: field_types[i].clone().unwrap(), key: fields[i].kind == Kind::Key }) }
+                Tok::Flag(_) => None, // zero-width: the line's presence is the value
             }).collect() }
         };
         let default_value = |f: &FieldDef| -> Result<Option<Value>> {
@@ -365,7 +372,7 @@ fn compile(d: &model::ModelDef, lines: &[TLine], field_types: &[Option<ScalarRef
         match values.as_slice() {
             [f] if f.kind == Kind::Many => Ok(Slot::Many { field: fidx(&f.name), model: index[f.type_spec.as_str()] }),
             [f] if f.kind == Kind::Flag => Ok(Slot::Flag {
-                lits: pattern(&toks.iter().filter(|t| matches!(t, Tok::Lit(_))).cloned().collect::<Vec<_>>()),
+                lits: pattern(toks),
                 field: fidx(&f.name),
                 default: f.default.as_ref().map(|d| d[0] == "true").unwrap_or(false),
             }),
@@ -453,7 +460,11 @@ impl Engine {
                 for n in nodes {
                     match self.claim(&slots[0], &mut states[0], n, &mut unmanaged) {
                         Claim::Claimed => {}
-                        Claim::NotMine => unmanaged.push(OwnedNode::from_node(n)),
+                        Claim::NotMine => {
+                            if m.ignores.iter().any(|p| ignore_matches(p, &n.tokens)) { unmanaged.push(OwnedNode::from_node(n)); }
+                            else if self.collides(&slots[0], n) { return Err(Error(self.unrepresentable(n))); }
+                            else { unmanaged.push(OwnedNode::from_node(n)); }
+                        }
                         Claim::Failed(e) => return Err(Error(e)),
                     }
                 }
@@ -485,7 +496,7 @@ impl Engine {
                 }
             }
             if slots.iter().any(|s| self.collides(s, n)) {
-                return Err(Error(format!("`{}`: starts like a managed line but matches no template line (unrepresentable); model it, or add an `@ignore` line to the template to accept it", n.line_text())));
+                return Err(Error(self.unrepresentable(n)));
             }
             unmanaged.push(OwnedNode::from_node(n));
         }
@@ -853,10 +864,10 @@ impl Engine {
                         match mode {
                             Mode::Opt => {
                                 out.push_str("  missing  → (nothing written)\n");
-                                if let Some(n) = neg { if pat.has_holes() { out.push_str(&format!("  null     → {prefix}{n} {}\n", pat.literal_prefix().join(" "))); } }
+                                if let Some(n) = neg { if pat.has_holes() { out.push_str(&format!("  null     → {n} {prefix}{}\n", pat.literal_prefix().join(" "))); } }
                             }
                             Mode::Default(_) => match neg {
-                                Some(n) if pat.has_holes() => out.push_str(&format!("  default  → (nothing written; `{prefix}{n} {}` is read as the default)\n  null     → {prefix}{n} {}\n", pat.literal_prefix().join(" "), pat.literal_prefix().join(" "))),
+                                Some(n) if pat.has_holes() => out.push_str(&format!("  default  → (nothing written; `{n} {prefix}{}` is read as the default)\n  null     → {n} {prefix}{}\n", pat.literal_prefix().join(" "), pat.literal_prefix().join(" "))),
                                 _ => out.push_str("  default  → (nothing written)\n"),
                             },
                             _ => {}
@@ -874,7 +885,7 @@ impl Engine {
                         } else {
                             out.push_str(&format!("  true     → {pos}{}\n", write(true)));
                             match neg {
-                                Some(n) => out.push_str(&format!("  false    → {prefix}{n} {}{}\n", show(lits), write(false))),
+                                Some(n) => out.push_str(&format!("  false    → {n} {prefix}{}{}\n", show(lits), write(false))),
                                 None => out.push_str(&format!("  false    → (no spelling in this dialect){}\n", write(false))),
                             }
                         }
@@ -903,6 +914,16 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    fn unrepresentable(&self, n: &Node<'_>) -> String {
+        let mut msg = format!("`{}`: starts like a managed line but matches no template line (unrepresentable); model it, or add an `@ignore` line to the template to accept it", n.line_text());
+        if let (Some(neg), Some(first)) = (&self.dialect.negation, n.tokens.first()) {
+            if first == neg && n.tokens.len() > 1 {
+                msg.push_str(&format!(". A `{neg}` line that still carries a value usually means an on/off setting: model it as a flag whose literals include the value (`… {} {{{{ field }}}}`), with the device default as its default", n.tokens[1..].join(" ")));
+            }
+        }
+        msg
     }
 
     /// `no <literal prefix>` of a value line: its implicit absent form.

@@ -8,7 +8,10 @@ use crate::model::{FieldDef, Kind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tok {
     Lit(String),
+    /// `{{ field }}`: consumes tokens.
     Hole(String),
+    /// `[[ field ]]`: consumes nothing; the line's presence is the flag's value.
+    Flag(String),
 }
 
 #[derive(Debug, Clone)]
@@ -21,14 +24,15 @@ pub struct TLine {
 }
 
 impl TLine {
+    /// Every bound field name, `{{ }}` and `[[ ]]` alike.
     pub fn holes(&self) -> Vec<&str> {
-        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) => Some(n.as_str()), _ => None }).collect()
+        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) | Tok::Flag(n) => Some(n.as_str()), _ => None }).collect()
     }
     pub fn lits(&self) -> Vec<String> {
         self.toks.iter().filter_map(|t| match t { Tok::Lit(s) => Some(s.clone()), _ => None }).collect()
     }
     pub fn text(&self) -> String {
-        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}") }).collect::<Vec<_>>().join(" ")
+        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]") }).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -56,8 +60,10 @@ pub fn from_nodes(nodes: &[crate::lexer::Node<'_>], first_line: usize) -> Result
         let toks = n.tokens.iter().map(|w| {
             if let Some(inner) = w.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
                 Tok::Hole(inner.trim().to_string())
+            } else if let Some(inner) = w.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+                Tok::Flag(inner.trim().to_string())
             } else {
-                if w.contains("{{") || w.contains("}}") { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}}")); }
+                if w.contains("{{") || w.contains("}}") || w.contains("[[") || w.contains("]]") { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value) or [[ name ]] (flag)")); }
                 Tok::Lit(w.to_string())
             }
         }).collect();
@@ -111,13 +117,13 @@ pub fn absent_spelling_of<'a>(l: &'a TLine, negation: Option<&str>, fields: &[Fi
     }
 }
 
-/// A flag's negated spelling written out explicitly (`no shutdown {{ shutdown }}` next to
-/// `shutdown {{ shutdown }}`). It is implied by the dialect anyway; writing it is allowed so
+/// A flag's negated spelling written out explicitly (`no shutdown [[ shutdown ]]` next to
+/// `shutdown [[ shutdown ]]`). It is implied by the dialect anyway; writing it is allowed so
 /// the template can show both spellings.
 pub fn negated_flag_line<'a>(l: &'a TLine, negation: Option<&str>, fields: &[FieldDef]) -> Option<&'a str> {
     let neg = negation?;
     match l.toks.as_slice() {
-        [Tok::Lit(first), .., Tok::Hole(h)] if first == neg && l.holes().len() == 1 && l.children.is_empty() && l.toks.len() > 2 => {
+        [Tok::Lit(first), .., Tok::Flag(h)] if first == neg && l.holes().len() == 1 && l.children.is_empty() && l.toks.len() > 2 => {
             fields.iter().find(|f| &f.name == h && f.kind == Kind::Flag).map(|_| h.as_str())
         }
         _ => None,
@@ -199,10 +205,17 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
         if let Some(m) = metas.iter().find(|m| m.kind == Kind::Many) {
             if l.toks.len() != 1 { err(errs, l, format!("collection `{{{{ {} }}}}` must be alone on its line", m.name)); }
         }
+        for t in &l.toks {
+            match t {
+                Tok::Hole(n) => if by_name(n).map(|f| f.kind == Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is a flag: write it as [[ {n} ]] (the line's presence), not {{{{ {n} }}}} (a value)")); },
+                Tok::Flag(n) => if by_name(n).map(|f| f.kind != Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is not a flag: [[ ]] is for flags; a value is written {{{{ {n} }}}}")); },
+                _ => {}
+            }
+        }
         if let Some(m) = metas.iter().find(|m| m.kind == Kind::Flag) {
             let value_holes = l.holes().into_iter().filter(|h| by_name(h).map(|f| f.kind != Kind::Key).unwrap_or(true)).count();
             if value_holes != 1 { err(errs, l, format!("flag `{}` must be the only value placeholder on its line", m.name)); }
-            if l.toks.last() != Some(&Tok::Hole(m.name.clone())) { err(errs, l, format!("flag `{}` must be the last token", m.name)); }
+            if l.toks.last() != Some(&Tok::Flag(m.name.clone())) { err(errs, l, format!("flag `{}` must be the last token", m.name)); }
         }
         for m in metas.iter().filter(|m| rest_of_line(m)) {
             if l.toks.last() != Some(&Tok::Hole(m.name.clone())) { err(errs, l, format!("`{}` consumes the rest of the line, so it must be last", m.name)); }
@@ -231,7 +244,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
                 if absent_spelling_of(l, negation, fields).is_some() || negated_flag_line(l, negation, fields).is_some() { err(&mut errs, l, "negated spellings are not supported in flat groups yet".into()); continue; }
                 let ks: Vec<&str> = l.holes().into_iter().filter(|h| keys.contains(h)).collect();
                 if ks != keys { err(&mut errs, l, format!("every line of a flat group must carry all Key fields in the same order ({})", keys.join(", "))); }
-                let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));
+                let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) | Tok::Flag(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));
                 let last_key = l.toks.iter().rposition(|t| matches!(t, Tok::Hole(n) if keys.contains(&n.as_str())));
                 if let (Some(fv), Some(lk)) = (first_value, last_key) { if lk > fv { err(&mut errs, l, "Key placeholders must come before value placeholders".into()); } }
                 if l.holes().into_iter().filter_map(by_name).any(|m| m.kind == Kind::Many) { err(&mut errs, l, "a flat group line cannot hold a collection".into()); }
@@ -248,7 +261,8 @@ mod tests {
 
     #[test]
     fn parses_holes_and_ignores() {
-        let ls = parse("interface {{ name }}\n  description {{ desc }}\n  @ignore ip address * * secondary\n", 10).unwrap();
+        let ls = parse("interface {{ name }}\n  description {{ desc }}\n  @ignore ip address * * secondary\n  shutdown [[ shut ]]\n", 10).unwrap();
+        assert_eq!(ls[0].children[2].toks, vec![Tok::Lit("shutdown".into()), Tok::Flag("shut".into())]);
         assert_eq!(ls[0].toks, vec![Tok::Lit("interface".into()), Tok::Hole("name".into())]);
         assert_eq!(ls[0].line, 10);
         assert_eq!(ls[0].children[1].ignore, true);

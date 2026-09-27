@@ -4,6 +4,8 @@
 type action = "permit" | "deny"
 # An AS to prepend, or the literal `auto`: alternatives are tried in order.
 type prependItem = asn | "auto"
+# `match community X Y` or `match community or-results X Y`.
+type communityMatch = {{ mode: "or-results" | "" }} {{ names: list(string) }}
 
 model RouteMapEntry
   name: key string
@@ -12,7 +14,7 @@ model RouteMapEntry
   description: phrase?
   matchPrefixLists: names?
   matchAcl: string?
-  matchCommunity: string?
+  matchCommunity: communityMatch?
   matchAsPath: string?
   setLocalPref: int?
   setMetric: int?

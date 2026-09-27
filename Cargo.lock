@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "netcfg"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "indexmap",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "netcfg-py"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "netcfg",
  "pyo3",

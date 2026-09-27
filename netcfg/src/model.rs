@@ -15,7 +15,7 @@
 //!   interface {{ name }}
 //!    description {{ description }}
 //!    mtu {{ mtu }}
-//!    shutdown {{ shutdown }}
+//!    shutdown [[ shutdown ]]
 //!    {{ subinterfaces }}
 //! ```
 
@@ -253,7 +253,7 @@ pub fn parse(source: &str, text: &str) -> Result<File> {
     if errors.is_empty() { Ok(file) } else { Err(Error(errors.join("\n"))) }
 }
 
-fn parse_struct_body(body: &str) -> std::result::Result<Vec<StructTok>, String> {
+pub fn parse_struct_body(body: &str) -> std::result::Result<Vec<StructTok>, String> {
     let mut toks = Vec::new();
     let mut rest = body;
     while !rest.is_empty() {
@@ -299,16 +299,21 @@ fn parse_field(t: &str, ln: usize) -> Result<FieldDef> {
     let (name, spec) = t.split_once(':').ok_or_else(|| Error(format!("expected `name: type`, got `{t}`")))?;
     let name = name.trim();
     if !is_ident(name) { return Err(Error(format!("`{name}` is not a valid field name"))); }
-    let (spec, default) = match spec.split_once('=') {
+    let (spec, default) = if spec.contains("{{") { (spec.trim(), None) } else { match spec.split_once('=') {
         Some((s, d)) => (s.trim(), Some(d.split_ascii_whitespace().map(String::from).collect::<Vec<_>>())),
         None => (spec.trim(), None),
-    };
+    } };
     if let Some(d) = &default { if d.is_empty() { return Err(Error(format!("field `{name}`: empty default"))); } }
     let (key, spec) = match spec.strip_prefix("key ") {
         Some(s) => (true, s.trim()),
         None => (false, spec),
     };
-    let (kind, type_spec) = if spec == "flag" {
+    // Anonymous struct: `{{ limit: int }} {{ action: "warning-only" | "" }}?`
+    let (spec, anon_opt) = match spec.strip_suffix('?') { Some(inner) if spec.contains("{{") => (inner.trim(), true), _ => (spec, false) };
+    let (kind, type_spec) = if spec.contains("{{") {
+        parse_struct_body(spec).map_err(|e| Error(format!("field `{name}`: {e}")))?;
+        (if anon_opt { Kind::Opt } else if key { Kind::Key } else { Kind::Scalar }, spec.to_string())
+    } else if spec == "flag" {
         (Kind::Flag, "flag".to_string())
     } else if let Some(inner) = spec.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         if !is_ident(inner.trim()) { return Err(Error(format!("field `{name}`: `{inner}` is not a model name"))); }

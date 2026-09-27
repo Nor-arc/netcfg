@@ -120,13 +120,16 @@ fn split_tokens(line: &str) -> Vec<&str> {
                 continue;
             }
         }
-        if line[i..].starts_with("{{") {
-            if let Some(end) = line[i..].find("}}") {
-                out.push(&line[i..i + end + 2]);
-                i += end + 2;
-                continue;
+        for (open, close) in [("{{", "}}"), ("[[", "]]")] {
+            if line[i..].starts_with(open) {
+                if let Some(end) = line[i..].find(close) {
+                    out.push(&line[i..i + end + 2]);
+                    i += end + 2;
+                    break;
+                }
             }
         }
+        if i > start { continue; }
         while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
             i += 1;
         }
@@ -183,8 +186,8 @@ pub fn lex_braces<'a>(text: &'a str) -> Vec<Node<'a>> {
             _ => {
                 if cur.is_empty() { cur_line = line; }
                 let start = i;
-                if text[i..].starts_with("{{") {
-                    let end = text[i..].find("}}").map(|e| i + e + 2).unwrap_or(b.len());
+                if let Some((_, close)) = [("{{", "}}"), ("[[", "]]")].iter().find(|(o, _)| text[i..].starts_with(o)) {
+                    let end = text[i..].find(close).map(|e| i + e + 2).unwrap_or(b.len());
                     cur.push(&text[start..end]);
                     i = end;
                     continue;
@@ -225,7 +228,7 @@ mod tests {
 
     #[test]
     fn quotes_and_placeholders_are_single_tokens() {
-        assert_eq!(split_tokens(r#"description "to core" {{ x }} y"#), vec!["description", "to core", "{{ x }}", "y"]);
+        assert_eq!(split_tokens(r#"description "to core" {{ x }} [[ f ]] y"#), vec!["description", "to core", "{{ x }}", "[[ f ]]", "y"]);
     }
 
     #[test]

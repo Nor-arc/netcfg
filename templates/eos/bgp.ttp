@@ -2,10 +2,6 @@
 # neighbor address. A model whose template has several top-level lines that all carry its
 # key is a flat keyed group: lines are grouped into one value per key.
 
-# A value with trailing modifiers is a struct type: its own little template, yielding a
-# record. Sub-fields whose type allows "" are omitted from the data when absent.
-type maxRoutes = {{ limit: int }} {{ action: "warning-only" | "warning-limit" | "" }}
-
 model EosNeighbor
   peer: key ip
   remoteAs: asn?
@@ -16,7 +12,9 @@ model EosNeighbor
   timers: intpair?
   routeMapIn: string?
   routeMapOut: string?
-  maximumRoutes: maxRoutes?
+  # A value with trailing modifiers is a struct type: its own little template, yielding a
+  # record. Sub-fields whose type allows "" are omitted from the data when absent.
+  maximumRoutes: {{ limit: int }} {{ action: "warning-only" | "warning-limit" | "" }}?
   sendCommunity: flag
   nextHopSelf: flag
   shutdown: flag
@@ -31,9 +29,9 @@ template
   neighbor {{ peer }} route-map {{ routeMapIn }} in
   neighbor {{ peer }} route-map {{ routeMapOut }} out
   neighbor {{ peer }} maximum-routes {{ maximumRoutes }}
-  neighbor {{ peer }} send-community {{ sendCommunity }}
-  neighbor {{ peer }} next-hop-self {{ nextHopSelf }}
-  neighbor {{ peer }} shutdown {{ shutdown }}
+  neighbor {{ peer }} send-community [[ sendCommunity ]]
+  neighbor {{ peer }} next-hop-self [[ nextHopSelf ]]
+  neighbor {{ peer }} shutdown [[ shutdown ]]
   @ignore neighbor * password
 
 model EosBgp

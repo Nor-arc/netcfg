@@ -22,8 +22,8 @@ template
    ip address {{ address }}
    mtu {{ mtu }}
    switchport access vlan {{ accessVlan }}
-   shutdown {{ shutdown }}
-   no shutdown {{ shutdown }}
+   shutdown [[ shutdown ]]
+   no shutdown [[ shutdown ]]
    @ignore ip address * * secondary
 
 model StaticRoute
