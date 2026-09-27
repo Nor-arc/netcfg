@@ -469,8 +469,8 @@ docs/                    design notes
 
 ## Next
 
-- Language server over `template.rs` / `model.rs` (diagnostics, completion of fields and types) and a TextMate grammar.
+- Language server and TextMate grammar ([scope](docs/language-server.md)).
 - A `set`-style input grammar (Junos `display set`, and vendors whose native form is flat paths).
-- Folded multi-line fields (`send-community` + `send-community extended` as one value).
+- Folded multi-line fields, `send-community` + `send-community extended` as one value ([design, for review](docs/folded-fields.md)).
 - Versioned template variants ([design](docs/template-variants.md)).
 - Golden real-device configs per OS version as the test oracle.
