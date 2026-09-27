@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 // ---- compiled form ------------------------------------------------------------------------
 
-enum PTok {
+pub(crate) enum PTok {
     Lit(String),
     Hole { field: usize, ty: ScalarRef, key: bool },
 }
 
 pub struct Pattern {
-    toks: Vec<PTok>,
+    pub(crate) toks: Vec<PTok>,
 }
 
 enum PRes {
@@ -34,7 +34,7 @@ enum PRes {
 }
 
 impl Pattern {
-    fn show(&self, fields: &[FieldDef]) -> String {
+    pub(crate) fn show(&self, fields: &[FieldDef]) -> String {
         self.toks.iter().map(|t| match t {
             PTok::Lit(s) => s.clone(),
             PTok::Hole { field, .. } => format!("{{{{ {} }}}}", fields[*field].name),
@@ -66,11 +66,11 @@ impl Pattern {
         }
     }
     /// The literal tokens before the first hole (`ip address` for `ip address {{ address }}`).
-    fn literal_prefix(&self) -> Vec<&str> {
+    pub(crate) fn literal_prefix(&self) -> Vec<&str> {
         self.toks.iter().take_while(|t| matches!(t, PTok::Lit(_))).map(|t| match t { PTok::Lit(s) => s.as_str(), _ => unreachable!() }).collect()
     }
-    fn has_holes(&self) -> bool { self.toks.iter().any(|t| matches!(t, PTok::Hole { .. })) }
-    fn hole_fields(&self) -> Vec<usize> { self.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(*field), _ => None }).collect() }
+    pub(crate) fn has_holes(&self) -> bool { self.toks.iter().any(|t| matches!(t, PTok::Hole { .. })) }
+    pub(crate) fn hole_fields(&self) -> Vec<usize> { self.toks.iter().filter_map(|t| match t { PTok::Hole { field, .. } => Some(*field), _ => None }).collect() }
 
     /// The line starts like this pattern: literals and key holes match up to the first value hole.
     fn collides(&self, toks: &[&str]) -> bool {
@@ -84,7 +84,7 @@ impl Pattern {
         }
         true
     }
-    fn render(&self, fields: &[FieldDef], rec: &Record) -> Result<Vec<String>> {
+    pub(crate) fn render(&self, fields: &[FieldDef], rec: &Record) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for t in &self.toks {
             match t {
@@ -100,13 +100,13 @@ impl Pattern {
     }
 }
 
-enum Mode {
+pub(crate) enum Mode {
     Required,
     Opt,
     Default(Value),
 }
 
-enum Slot {
+pub(crate) enum Slot {
     Line { pat: Pattern, mode: Mode },
     Flag { lits: Pattern, field: usize, default: bool },
     /// `<< field >>`: blocks/groups of a nested model.
@@ -117,7 +117,7 @@ enum Slot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Card {
+pub(crate) enum Card {
     /// `[Model]`: keyed; a repeated key is an error.
     Many,
     /// `[Model] ordered`: positional; every match in order, duplicates allowed.
@@ -125,7 +125,7 @@ enum Card {
     Single { required: bool },
 }
 
-enum CShape {
+pub(crate) enum CShape {
     Block { header: Pattern, key_fields: Vec<usize>, body: Vec<Slot> },
     Flat { keys: Pattern, lines: Vec<Slot> },
     Root { body: Vec<Slot> },
@@ -135,7 +135,7 @@ pub struct Compiled {
     pub name: String,
     pub fields: Vec<FieldDef>,
     pub doc: Option<String>,
-    shape: CShape,
+    pub(crate) shape: CShape,
     /// `@ignore` prefixes: for blocks/roots they apply to the body; for flat groups to the parent level.
     ignores: Vec<Vec<String>>,
     /// Field types, for schema generation (`None` for flags and collections).
@@ -151,7 +151,7 @@ impl Compiled {
 pub struct Engine {
     pub dialect: Dialect,
     pub catalog: Catalog,
-    models: IndexMap<String, Compiled>,
+    pub(crate) models: IndexMap<String, Compiled>,
     /// Non-fatal notes from loading (deprecations), each naming file and line.
     pub warnings: Vec<String>,
     /// The manifest's `version`, if the engine was loaded from a versioned set.
@@ -993,12 +993,22 @@ impl Engine {
 
     // ---- rendering -----------------------------------------------------------------------
 
+    /// Render in canonical form: flags and defaulted fields only when they differ from
+    /// their defaults.
     pub fn render(&self, model: &str, value: &Value) -> Result<String> {
-        Ok(self.dialect.render(&self.render_nodes(model, value)?))
+        self.render_with(model, value, RenderMode::Canonical)
+    }
+
+    pub fn render_with(&self, model: &str, value: &Value, mode: RenderMode) -> Result<String> {
+        Ok(self.dialect.render(&self.render_nodes_with(model, value, mode)?))
     }
 
     pub fn render_nodes(&self, model: &str, value: &Value) -> Result<Vec<OwnedNode>> {
-        let (nodes, errs) = self.render_checked(model, value)?;
+        self.render_nodes_with(model, value, RenderMode::Canonical)
+    }
+
+    pub fn render_nodes_with(&self, model: &str, value: &Value, mode: RenderMode) -> Result<Vec<OwnedNode>> {
+        let (nodes, errs) = self.render_checked(model, value, mode)?;
         match errs.into_iter().next() { Some(e) => Err(e), None => Ok(nodes) }
     }
 
@@ -1006,14 +1016,14 @@ impl Engine {
     /// types, struct shapes, duplicate keys), in document order; empty when the data is valid.
     /// This is the render path with output discarded, so messages are the ones `render` gives.
     pub fn validate_data(&self, model: &str, value: &Value) -> Result<Vec<Error>> {
-        Ok(self.render_checked(model, value)?.1)
+        Ok(self.render_checked(model, value, RenderMode::Canonical)?.1)
     }
 
-    fn render_checked(&self, model: &str, value: &Value) -> Result<(Vec<OwnedNode>, Vec<Error>)> {
+    fn render_checked(&self, model: &str, value: &Value, mode: RenderMode) -> Result<(Vec<OwnedNode>, Vec<Error>)> {
         let mi = self.model_idx(model)?;
         let mut errs = Vec::new();
         let nodes = match value.as_record() {
-            Some(rec) => self.render_one(&self.models[mi], rec, model, &mut errs),
+            Some(rec) => self.render_one(&self.models[mi], rec, model, mode, &mut errs),
             None => { errs.push(Error(format!("{model}: expected a record, got {}", value.to_json()))); Vec::new() }
         };
         Ok((nodes, errs))
@@ -1021,16 +1031,16 @@ impl Engine {
 
     /// Render one record of `m`. `path` locates it in the data (`Device.bgp[0]`); problems are
     /// pushed to `errs` and the offending part is skipped.
-    fn render_one(&self, m: &Compiled, rec: &Record, path: &str, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+    pub(crate) fn render_one(&self, m: &Compiled, rec: &Record, path: &str, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
         for k in rec.keys() {
             if !m.fields.iter().any(|f| &f.name == k) {
                 errs.push(Error(format!("{path}: unknown field `{k}` ({} fields: {})", m.name, m.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "))));
             }
         }
         match &m.shape {
-            CShape::Root { body } => self.render_body(m, body, rec, path, errs),
+            CShape::Root { body } => self.render_body(m, body, rec, path, mode, errs),
             CShape::Block { header, body, .. } => match header.render(&m.fields, rec) {
-                Ok(h) => vec![OwnedNode::with_children(h, self.render_body(m, body, rec, path, errs))],
+                Ok(h) => vec![OwnedNode::with_children(h, self.render_body(m, body, rec, path, mode, errs))],
                 Err(e) => { errs.push(Error(format!("{path}: {}", e.0))); Vec::new() }
             },
             CShape::Flat { keys, lines } => {
@@ -1039,7 +1049,7 @@ impl Engine {
                     Err(e) => { errs.push(Error(format!("{path}: {}", e.0))); return Vec::new(); }
                 };
                 let neg = self.dialect.negation.as_deref();
-                self.render_body(m, lines, rec, path, errs).into_iter().map(|n| {
+                self.render_body(m, lines, rec, path, mode, errs).into_iter().map(|n| {
                     // Flat lines carry the key after the negation word: `no neighbor X shutdown`.
                     let negated = neg.is_some() && n.tokens.first().map(String::as_str) == neg;
                     let mut t: Vec<String> = if negated { vec![n.tokens[0].clone()] } else { Vec::new() };
@@ -1051,7 +1061,8 @@ impl Engine {
         }
     }
 
-    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record, path: &str, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+    fn render_body(&self, m: &Compiled, slots: &[Slot], rec: &Record, path: &str, mode: RenderMode, errs: &mut Vec<Error>) -> Vec<OwnedNode> {
+        let explicit = mode == RenderMode::Explicit;
         let mut out = Vec::new();
         macro_rules! fail {
             ($($arg:tt)*) => {{ errs.push(Error(format!("{path}: {}", format!($($arg)*)))); continue; }};
@@ -1070,7 +1081,18 @@ impl Engine {
                             None => fail!("field `{}`: null has no spelling in this dialect (no negation word)", m.fields[hole_fields[0]].name),
                         },
                         Mode::Opt => if present == 0 { continue; },
-                        Mode::Default(d) => if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; },
+                        Mode::Default(d) => {
+                            if explicit {
+                                // Write the default too; a missing value is the default.
+                                let name = &m.fields[hole_fields[0]].name;
+                                if present == 0 {
+                                    let mut with = rec.clone();
+                                    with.insert(name.clone(), d.clone());
+                                    match pat.render(&m.fields, &with) { Ok(t) => out.push(OwnedNode::leaf(t)), Err(e) => fail!("{}", e.0) }
+                                    continue;
+                                }
+                            } else if present == 0 || rec.get(&m.fields[hole_fields[0]].name) == Some(d) { continue; }
+                        }
                         Mode::Required => if present < hole_fields.len() {
                             let missing: Vec<&str> = hole_fields.iter().map(|&i| m.fields[i].name.as_str()).filter(|n| rec.get(*n).map(Value::is_null).unwrap_or(true)).collect();
                             fail!("required line `{}`: field(s) missing: {}", pat.show(&m.fields), missing.join(", "));
@@ -1087,8 +1109,9 @@ impl Engine {
                         Some(Value::Bool(b)) => *b,
                         Some(v) => fail!("field `{}`: expected true/false, got {}", m.fields[*field].name, v.to_json()),
                     };
-                    if v == *default { continue; }
-                    if !v && (self.dialect.negation.is_none() || self.literal_no(lits)) {
+                    let unspellable = !v && (self.dialect.negation.is_none() || self.literal_no(lits));
+                    if v == *default && !(explicit && !unspellable) { continue; }
+                    if unspellable {
                         fail!("field `{}`: false has no spelling in this dialect (there is no negation for `{}`)", m.fields[*field].name, lits.show(&m.fields));
                     }
                     let mut toks = if v { Vec::new() } else { vec![self.dialect.negation.clone().unwrap()] };
@@ -1099,7 +1122,7 @@ impl Engine {
                     out.push(OwnedNode::leaf(toks));
                 }
                 Slot::Container { lits, body, .. } => {
-                    let children = self.render_body(m, body, rec, path, errs);
+                    let children = self.render_body(m, body, rec, path, mode, errs);
                     if !children.is_empty() {
                         match lits.render(&m.fields, rec) {
                             Ok(t) => out.push(OwnedNode { tokens: t, children, block: false }),
@@ -1113,7 +1136,7 @@ impl Engine {
                     match rec.get(name) {
                         None | Some(Value::Null) if *required => fail!("field `{name}` is missing (a required {})", sub.name),
                         None | Some(Value::Null) => {}
-                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r, &format!("{path}.{name}"), errs)),
+                        Some(Value::Record(r)) => out.extend(self.render_one(sub, r, &format!("{path}.{name}"), mode, errs)),
                         Some(v) => fail!("field `{name}`: expected a record ({}), got {}", sub.name, v.to_json()),
                     }
                 }
@@ -1141,13 +1164,23 @@ impl Engine {
                             }
                             seen.insert(key, i);
                         }
-                        out.extend(self.render_one(sub, r, &at, errs));
+                        out.extend(self.render_one(sub, r, &at, mode, errs));
                     }
                 }
             }
         }
         out
     }
+}
+
+/// How `render` treats flags and defaulted fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// Only what differs from the declared defaults (the parse of it is the same data).
+    #[default]
+    Canonical,
+    /// Every flag and every defaulted field, including defaults (when they have a spelling).
+    Explicit,
 }
 
 /// A field's doc as one line under its `explain` heading.
@@ -1274,7 +1307,7 @@ impl Engine {
     }
 
     /// True when a flag's literals themselves start with the negation word.
-    fn literal_no(&self, lits: &Pattern) -> bool {
+    pub(crate) fn literal_no(&self, lits: &Pattern) -> bool {
         matches!((&self.dialect.negation, lits.toks.first()), (Some(neg), Some(PTok::Lit(first))) if first == neg)
     }
 

@@ -82,6 +82,20 @@ fn warn(py: Python<'_>, core: &Core) -> PyResult<()> {
     Ok(())
 }
 
+/// The commands that take a running config to intent (see `Engine.diff`).
+#[pyclass]
+struct ChangeSet {
+    /// Config text ready to paste, in the dialect's syntax.
+    #[pyo3(get)]
+    text: String,
+    /// Flattened operations: dicts with `op` ("set"/"delete"), `path`, `line` and `was`.
+    #[pyo3(get)]
+    ops: PyObject,
+    /// True when running already matches intent.
+    #[pyo3(get)]
+    empty: bool,
+}
+
 #[pyclass]
 struct Engine {
     core: Core,
@@ -144,10 +158,24 @@ impl Engine {
         Ok(Parsed { value: to_py(py, &parsed.value)?, unmanaged: parsed.unmanaged_paths(), engine_version: parsed.engine_version, templates_version: parsed.templates_version })
     }
 
-    /// Render model data (dict) to config text.
-    fn render(&self, py: Python<'_>, model: &str, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    /// Render model data (dict) to config text. `explicit=True` writes every flag and
+    /// defaulted field even at its default.
+    #[pyo3(signature = (model, value, explicit = false))]
+    fn render(&self, py: Python<'_>, model: &str, value: &Bound<'_, PyAny>, explicit: bool) -> PyResult<String> {
         let v = from_py(value)?;
-        py.allow_threads(|| self.core.render(model, &v)).map_err(|e| PyValueError::new_err(e.0))
+        let mode = if explicit { netcfg_core::RenderMode::Explicit } else { netcfg_core::RenderMode::Canonical };
+        py.allow_threads(|| self.core.render_with(model, &v, mode)).map_err(|e| PyValueError::new_err(e.0))
+    }
+
+    /// The change set taking `running` (data, e.g. `parse(...).value`) to `intent`. With
+    /// `explicit=True` intent is the complete desired state (missing keys are cleared).
+    #[pyo3(signature = (model, running, intent, explicit = false))]
+    fn diff(&self, py: Python<'_>, model: &str, running: &Bound<'_, PyAny>, intent: &Bound<'_, PyAny>, explicit: bool) -> PyResult<ChangeSet> {
+        let (r, i) = (from_py(running)?, from_py(intent)?);
+        let opts = netcfg_core::diff::DiffOptions { explicit };
+        let cs = py.allow_threads(|| self.core.diff_with(model, &r, &i, opts)).map_err(|e| PyValueError::new_err(e.0))?;
+        let text = cs.to_text().map_err(|e| PyValueError::new_err(e.0))?;
+        Ok(ChangeSet { text, ops: to_py(py, &Value::from_json(&cs.to_json()))?, empty: cs.is_empty() })
     }
 
     /// How every field of a model is spelled in config (the `netcfg explain` table).
@@ -191,6 +219,7 @@ fn netcfg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_function(wrap_pyfunction!(load_all, m)?)?;
     m.add_class::<Parsed>()?;
+    m.add_class::<ChangeSet>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__build__", concat!(env!("CARGO_PKG_VERSION"), "+", env!("NETCFG_BUILD")))?;
     Ok(())

@@ -6,6 +6,7 @@
 //! an error unless the template opts out with `@ignore`.
 
 pub mod dialect;
+pub mod diff;
 pub mod engine;
 pub mod fmt;
 pub mod lexer;
@@ -18,7 +19,7 @@ pub mod types;
 pub mod value;
 
 pub use dialect::Dialect;
-pub use engine::{Engine, Parsed, ENGINE_VERSION};
+pub use engine::{Engine, Parsed, RenderMode, ENGINE_VERSION};
 pub use lexer::Node;
 pub use value::{Record, Value};
 

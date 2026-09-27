@@ -11,6 +11,7 @@
 //!   block-separator: !       # written after each top-level block (IOS)
 //!   end-marker: end          # written at the end (IOS)
 //!   negation: no             # prefix that negates a flag line
+//!   delete: no               # prefix that removes a statement/block (defaults to negation)
 //!   cidr: slash              # a type convention: slash | masked
 //!   render: structured       # structured | set  (braces grammar only)
 //! ```
@@ -39,6 +40,9 @@ pub struct Dialect {
     pub end_marker: Option<String>,
     /// Prefix that negates a flag line (`no shutdown`).
     pub negation: Option<String>,
+    /// Prefix that removes a statement or block in a change set: `no` (indent dialects, the
+    /// default is the negation word), `delete` (Junos `set` style: `delete protocols bgp`).
+    pub delete: Option<String>,
     /// Braces grammar: render as `set` commands instead of structured text.
     pub render_set: bool,
     /// Type conventions, e.g. `cidr: masked`.
@@ -51,7 +55,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("ios", "dialect ios\n  extends: cisco\n  indent: 1\n  block-separator: !\n  end-marker: end\n  cidr: masked\n"),
     ("nxos", "dialect nxos\n  extends: cisco\n  indent: 2\n"),
     ("eos", "dialect eos\n  extends: cisco\n  indent: 3\n"),
-    ("junos", "dialect junos\n  grammar: braces\n  indent: 4\n  cidr: slash\n  render: structured\n"),
+    ("junos", "dialect junos\n  grammar: braces\n  indent: 4\n  cidr: slash\n  render: structured\n  delete: delete\n"),
 ];
 
 impl Dialect {
@@ -88,7 +92,7 @@ impl Dialect {
     pub fn from_props(name: &str, props: &[(String, String, usize)]) -> Result<Dialect> {
         let mut d = match props.iter().find(|(k, _, _)| k == "extends") {
             Some((_, base, ln)) => Dialect::builtin(base).ok_or_else(|| Error(format!("line {ln}: unknown base dialect `{base}` (builtin: {})", Dialect::builtin_names().join(", "))))?,
-            None => Dialect { name: String::new(), grammar: Grammar::Indent, indent: 1, comments: Vec::new(), skip: Vec::new(), block_separator: None, end_marker: None, negation: None, render_set: false, knobs: HashMap::new() },
+            None => Dialect { name: String::new(), grammar: Grammar::Indent, indent: 1, comments: Vec::new(), skip: Vec::new(), block_separator: None, end_marker: None, negation: None, delete: None, render_set: false, knobs: HashMap::new() },
         };
         d.name = name.to_string();
         let list = |v: &str| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
@@ -103,11 +107,17 @@ impl Dialect {
                 "block-separator" => d.block_separator = opt(v),
                 "end-marker" => d.end_marker = opt(v),
                 "negation" => d.negation = opt(v),
+                "delete" => d.delete = opt(v),
                 "render" => d.render_set = match v.as_str() { "structured" => false, "set" => true, other => return Err(Error(format!("line {ln}: render must be structured or set, got `{other}`"))) },
                 other => { d.knobs.insert(other.to_string(), v.clone()); }
             }
         }
         Ok(d)
+    }
+
+    /// The word that removes a statement: `delete`, else the negation word.
+    pub fn delete_word(&self) -> Option<&str> {
+        self.delete.as_deref().or(self.negation.as_deref())
     }
 
     pub fn knob(&self, name: &str) -> Option<&str> {
@@ -185,7 +195,7 @@ impl Dialect {
 }
 
 /// Tokens containing whitespace came from quoted strings; write them quoted again.
-fn quote(t: &str) -> String {
+pub(crate) fn quote(t: &str) -> String {
     if t.contains(char::is_whitespace) || t.is_empty() { format!("\"{t}\"") } else { t.to_string() }
 }
 
@@ -205,6 +215,9 @@ mod tests {
         assert_eq!(nx.indent, 2);
         assert!(nx.end_marker.is_none());
         assert_eq!(Dialect::builtin("junos").unwrap().grammar, Grammar::Braces);
+        assert_eq!(nx.delete_word(), Some("no"));
+        assert_eq!(Dialect::builtin("junos").unwrap().delete_word(), Some("delete"));
+        assert_eq!(Dialect::from_text("dialect x\n  extends: ios\n  delete: default\n").unwrap().delete_word(), Some("default"));
     }
 
     #[test]

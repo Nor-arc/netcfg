@@ -64,4 +64,12 @@ assert sorted(sets) == ["eos", "ios", "junos", "nxos"], sets
 assert netcfg.Engine(str(T / "eos" / "set.nct")).set_name == "eos"
 assert s.set_name is None and s.parse("D", "").templates_version == "unversioned"
 
+# Change sets and render modes.
+intent = dict(r.value, hostname="leaf2")
+cs = e.diff("Device", r.value, intent)
+assert cs.text == "hostname leaf2\n" and not cs.empty, cs.text
+assert cs.ops == [{"op": "set", "path": [], "line": "hostname leaf2", "was": "hostname leaf1"}], cs.ops
+assert e.diff("Device", r.value, r.value).empty
+assert "    no shutdown\n" in e.render("Device", r.value, explicit=True)
+
 print("ok")

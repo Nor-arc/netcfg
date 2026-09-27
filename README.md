@@ -179,7 +179,7 @@ dialect iosxe
   skip: end, Building configuration, Current configuration, Load for
 ```
 
-Properties: `grammar`, `indent`, `comments`, `skip`, `block-separator`, `end-marker`, `negation` (the prefix that negates a flag line, `no`), `render`, and type knobs such as `cidr`. Templates are lexed with the dialect's grammar, so a Junos template is written in Junos syntax:
+Properties: `grammar`, `indent`, `comments`, `skip`, `block-separator`, `end-marker`, `negation` (the prefix that negates a flag line, `no`), `delete` (the prefix that removes a statement or block in a change set; defaults to `negation` on indent dialects, `delete` on Junos, where it is a path prefix: `delete protocols bgp group EXT`), `render`, and type knobs such as `cidr`. Templates are lexed with the dialect's grammar, so a Junos template is written in Junos syntax:
 
 ```text
 template JunosDevice
@@ -207,6 +207,70 @@ With `negation: no` declared in the dialect, every value line has a negated form
 
 Parsing `no <the line's literals>` yields `null` for an optional field (and the default for a defaulted one); `null` in intent data renders the negated form, which is also the command that clears the setting on the device. A missing key writes nothing. Flags follow the same idea with `true`/`false`: `no shutdown` is `false`, and a flag is written when its value differs from its declared default, so declare the *device's* default (`shutdown: flag = true` on platforms that shut interfaces by default). Writing `no shutdown [[ shutdown ]]` in a template is allowed for readability and changes nothing. `netcfg explain` prints this table for any model, and the JSON Schema marks optional fields nullable when the dialect has a negation word.
 
+## Change sets (`netcfg diff`)
+
+```
+netcfg diff templates/nxos running.cfg intent.yaml --model Device            # config text to paste
+netcfg diff templates/nxos running.cfg intent.yaml --model Device --format json
+```
+
+`diff` parses the running config, validates the intent (every error, as `validate-data`),
+and walks both by model:
+
+- keyed collections match elements by key: an added element is rendered in full, a removed
+  one is `<delete> <header>` (`no neighbor 10.1.0.2`; for an EOS flat group this removes every
+  line of the group), and a changed one is entered by its header with the changed lines
+  inside. A changed value on the header line (a route-map's action) re-enters the block with
+  the new header;
+- positional (`ordered`) collections are replaced whole when anything differs: every running
+  element is removed, then every intent element is added in order;
+- singletons compare presence (a different key is a remove plus an add).
+
+For each field:
+
+| running → intent | command |
+|---|---|
+| same | nothing |
+| anything → a different value | the value line |
+| value or missing → `null` | the negated form (`no remote-as`) |
+| anything → key missing | nothing: missing means "no opinion" (unless `--explicit`) |
+| flag changes | the positive or negated line; back to a defaulted value: its negated form |
+
+With `--explicit`, intent is the complete desired state: a missing value is cleared, a missing
+flag or defaulted field is its default, and a missing collection is empty. Removals come
+before additions at each level. Unmanaged lines of the running config are never touched;
+`--show-unmanaged` lists them on stderr. `--format json` gives a flat list of operations,
+`{"op": "set"|"delete", "path": [enclosing headers], "line": ..., "was": the running line it
+replaces}`, with the provenance fields. Library: `Engine::diff(model, &running, &intent)` →
+`ChangeSet` (`to_text`, `to_json`, `ops`); Python: `Engine.diff(model, running, intent)` →
+`ChangeSet` with `.text`, `.ops`, `.empty`.
+
+Braces dialects need `render: set` for change sets (`set ...` / `delete ...` lines); structured
+braces output has no way to delete, so `diff` refuses it.
+
+**Limits.** A change set is correct for a device that (1) replaces a setting when the same
+command is given with a new value, (2) clears a setting with `<negation> <the line's
+literals>` and (3) removes a block with `<delete> <header>`. That holds for the common IOS,
+NX-OS and EOS commands modelled here, and the test suite checks it by applying change sets
+to rendered configs and re-parsing. It does not hold for additive commands modelled as a
+single value (`ntp server X` modelled as one value would add a second server rather than
+replace the first; model such lines as a keyed collection), and a device may print a
+negated line differently from how it accepts it. Headers whose value changes are re-entered
+with the new value, which relies on the device editing the entry in place.
+
+## Render modes and provenance
+
+`render` writes canonical config by default (`--canonical`): flags and defaulted fields only
+when they differ from their declared defaults, so the output parses back to the same data.
+`render --explicit` (`RenderMode::Explicit`, Python `render(..., explicit=True)`) writes every
+flag and defaulted field, including defaults that have a spelling.
+
+Parse results carry `engine_version` and `templates_version` (the set manifest's `version`,
+`"unversioned"` for directory loads). `parse --format json` prints an envelope,
+`{"engine_version", "templates_version", "model", "value", "unmanaged"}`; YAML output is the
+data with the same provenance in a leading comment. `render`, `validate-data` and `diff`
+accept either the envelope or plain data.
+
 ## Data validation
 
 `render` and `validate-data` apply the same checks to data: unknown fields, wrong types,
@@ -232,7 +296,8 @@ netcfg validate --set templates/nxos/set.nct
 netcfg parse --set templates/nxos/set.nct running.cfg --model Device
 netcfg validate templates/nxos
 netcfg parse   templates/nxos running.cfg --model Device --format yaml --unmanaged
-netcfg render  templates/nxos intent.yaml  --model Device
+netcfg render  templates/nxos intent.yaml  --model Device   # --explicit writes defaults too
+netcfg diff    templates/nxos running.cfg intent.yaml --model Device
 netcfg explain templates/ios  --model Interface     # how each field is spelled: value, absent, true/false, defaults
 netcfg schema  templates/nxos --model Device        # JSON Schema for editor completion/validation
 netcfg skeleton templates/nxos --model Device       # example YAML: every field, typed placeholders, docs
@@ -293,6 +358,7 @@ netcfg/src/engine.rs     compile to patterns/slots; strict node-major parse; ren
 netcfg/src/schema.rs     JSON Schema from model declarations
 netcfg/src/skeleton.rs   example YAML for a model
 netcfg/src/set.rs        set manifests: files, includes, version, load_set / load_all
+netcfg/src/diff.rs       change sets: running data -> intent data as config commands
 netcfg/src/main.rs       CLI
 netcfg-py/               PyO3 bindings (maturin)
 templates/{ios,nxos,eos,junos} example sets (each with a set.nct manifest)
@@ -304,6 +370,6 @@ docs/                    design notes
 
 - Language server over `template.rs` / `model.rs` (diagnostics, completion of fields and types) and a TextMate grammar.
 - A `set`-style input grammar (Junos `display set`, and vendors whose native form is flat paths).
-- Folded multi-line fields, ordered `seq` collections (ACLs, route-map `continue`).
+- Folded multi-line fields (`send-community` + `send-community extended` as one value).
+- Versioned template variants ([design](docs/template-variants.md)).
 - Golden real-device configs per OS version as the test oracle.
-- Typed diff of two model values → minimal config change.

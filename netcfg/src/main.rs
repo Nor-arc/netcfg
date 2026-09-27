@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use netcfg::{Engine, Value};
+use netcfg::diff::DiffOptions;
+use netcfg::{Engine, RenderMode, Value};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,6 +13,9 @@ struct Cli {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Format { Json, Yaml }
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DiffFormat { Text, Json }
 
 /// Where the templates come from: `--set path/to/set.nct`, or a leading TEMPLATES argument
 /// (a set manifest, or a directory: its manifest if it has one, else every .nct file in it).
@@ -33,7 +37,9 @@ enum Cmd {
         #[arg(value_name = "TEMPLATES")] paths: Vec<PathBuf>,
         #[command(flatten)] src: Src,
     },
-    /// Parse a running config into model data (JSON/YAML) plus the unmanaged report.
+    /// Parse a running config into model data plus the unmanaged report. JSON output is an
+    /// envelope with provenance: {engine_version, templates_version, model, value, unmanaged};
+    /// YAML output is the data, with the provenance in a leading comment.
     Parse {
         #[arg(value_name = "[TEMPLATES] CONFIG", num_args = 1..=2, required = true)] paths: Vec<PathBuf>,
         #[arg(long)] model: String,
@@ -46,6 +52,21 @@ enum Cmd {
     Render {
         #[arg(value_name = "[TEMPLATES] DATA", num_args = 1..=2, required = true)] paths: Vec<PathBuf>,
         #[arg(long)] model: String,
+        /// Write every flag and defaulted field, even at its default.
+        #[arg(long, conflicts_with = "canonical")] explicit: bool,
+        /// Write flags and defaulted fields only when they differ from the default (the default).
+        #[arg(long)] canonical: bool,
+        #[command(flatten)] src: Src,
+    },
+    /// The commands that take a running config to intent data.
+    Diff {
+        #[arg(value_name = "[TEMPLATES] RUNNING INTENT", num_args = 2..=3, required = true)] paths: Vec<PathBuf>,
+        #[arg(long)] model: String,
+        #[arg(long, value_enum, default_value = "text")] format: DiffFormat,
+        /// Intent is the complete desired state: missing keys are cleared/defaulted/emptied.
+        #[arg(long)] explicit: bool,
+        /// List the running config's unmanaged lines (never touched) on stderr.
+        #[arg(long)] show_unmanaged: bool,
         #[command(flatten)] src: Src,
     },
     /// Show how every field of a model is spelled in config (values, defaults, negations).
@@ -116,6 +137,7 @@ fn read_text(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Data from JSON/YAML. The envelope `parse --format json` writes is unwrapped.
 fn read_data(path: &Path) -> Result<Value, String> {
     let text = read_text(path)?;
     let j: serde_json::Value = if path.extension().map(|x| x == "json").unwrap_or(false) {
@@ -123,7 +145,19 @@ fn read_data(path: &Path) -> Result<Value, String> {
     } else {
         serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
     };
+    let j = match j {
+        serde_json::Value::Object(mut o) if o.contains_key("engine_version") && o.contains_key("value") => o.remove("value").unwrap(),
+        j => j,
+    };
     Ok(Value::from_json(&j))
+}
+
+fn provenance(e: &Engine, model: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("engine_version".into(), netcfg::ENGINE_VERSION.into());
+    m.insert("templates_version".into(), e.templates_version().into());
+    m.insert("model".into(), model.into());
+    m
 }
 
 fn template_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -175,17 +209,44 @@ fn run(cli: Cli) -> Result<(), String> {
             let p = e.parse(&model, &read_text(&rest[0])?).map_err(|e| e.0)?;
             let j = p.value.to_json();
             match format {
-                Format::Json => println!("{}", serde_json::to_string_pretty(&j).unwrap()),
-                Format::Yaml => print!("{}", serde_yaml::to_string(&j).unwrap()),
+                Format::Json => {
+                    let mut env = provenance(&e, &model);
+                    env.insert("value".into(), j);
+                    env.insert("unmanaged".into(), p.unmanaged_paths().into());
+                    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(env)).unwrap());
+                }
+                Format::Yaml => {
+                    println!("# {model}: netcfg {}, templates {}", p.engine_version, p.templates_version);
+                    print!("{}", serde_yaml::to_string(&j).unwrap());
+                }
             }
             if unmanaged {
                 for path in p.unmanaged_paths() { eprintln!("unmanaged: {path}"); }
             }
             Ok(())
         }
-        Cmd::Render { paths, model, src } => {
+        Cmd::Render { paths, model, explicit, canonical: _, src } => {
             let (e, rest) = load(&src, &paths, &["DATA"])?;
-            print!("{}", e.render(&model, &read_data(&rest[0])?).map_err(|e| e.0)?);
+            let mode = if explicit { RenderMode::Explicit } else { RenderMode::Canonical };
+            print!("{}", e.render_with(&model, &read_data(&rest[0])?, mode).map_err(|e| e.0)?);
+            Ok(())
+        }
+        Cmd::Diff { paths, model, format, explicit, show_unmanaged, src } => {
+            let (e, rest) = load(&src, &paths, &["RUNNING", "INTENT"])?;
+            let running = e.parse(&model, &read_text(&rest[0])?).map_err(|e| format!("{}: {}", rest[0].display(), e.0))?;
+            let intent = read_data(&rest[1])?;
+            let cs = e.diff_with(&model, &running.value, &intent, DiffOptions { explicit }).map_err(|e| e.0)?;
+            if show_unmanaged {
+                for path in running.unmanaged_paths() { eprintln!("unmanaged: {path}"); }
+            }
+            match format {
+                DiffFormat::Text => print!("{}", cs.to_text().map_err(|e| e.0)?),
+                DiffFormat::Json => {
+                    let mut env = provenance(&e, &model);
+                    env.insert("changes".into(), cs.to_json());
+                    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(env)).unwrap());
+                }
+            }
             Ok(())
         }
         Cmd::Explain { paths, model, src } => {

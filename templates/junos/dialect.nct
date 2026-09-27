@@ -1,7 +1,9 @@
 # Junos structured configuration: nesting by braces, statements end with `;`.
-# `render: set` would emit `set ...` commands instead (loadable with `load set`).
+# `render: set` would emit `set ...` commands instead (loadable with `load set`); change sets
+# (`netcfg diff`) need it, and remove statements with the `delete` word.
 dialect junos
   grammar: braces
   indent: 4
   cidr: slash
   render: structured
+  delete: delete
