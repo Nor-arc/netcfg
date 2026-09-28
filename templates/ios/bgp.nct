@@ -1,0 +1,46 @@
+# BGP in IOS/IOS-XE style: neighbors are flat lines under `router bgp`, and per-family
+# settings live in `address-family` blocks.
+
+model IosNeighbor
+  peer: key ip
+  remoteAs: asn?
+  description: phrase?
+
+template IosNeighbor
+  neighbor {{ peer }} remote-as {{ remoteAs }}
+  neighbor {{ peer }} description {{ description }}
+
+model IosAfNeighbor
+  peer: key ip
+  routeMapIn: string?
+  routeMapOut: string?
+
+# `neighbor X activate` is a constant line: a neighbor listed in a family is always activated
+# there. A device that prints `no neighbor X activate` needs a flag instead.
+template IosAfNeighbor
+  neighbor {{ peer }} activate
+  neighbor {{ peer }} route-map {{ routeMapIn }} in
+  neighbor {{ peer }} route-map {{ routeMapOut }} out
+
+model IosAf
+  afi: key string
+  neighbors: [IosAfNeighbor]
+
+template IosAf
+  address-family {{ afi }}
+   << neighbors >>
+
+model IosBgp
+  asn: key asn
+  routerId: ipv4?
+  neighbors: [IosNeighbor]
+  families: [IosAf]
+
+template IosBgp
+  router bgp {{ asn }}
+   bgp router-id {{ routerId }}
+   << neighbors >>
+   << families >>
+   ## IOS closes each family with `exit-address-family` at this level, one per family, so
+   ## it cannot be a constant line of either block.
+   @ignore exit-address-family

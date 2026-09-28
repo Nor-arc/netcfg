@@ -99,7 +99,10 @@ pub fn lex_indent<'a>(text: &'a str, skip: &dyn Fn(&str) -> bool) -> Vec<Node<'a
     stack.pop().unwrap().children
 }
 
-/// Whitespace split that keeps `{{ ... }}` placeholders and `"quoted strings"` as one token.
+/// Placeholder markers kept as one token by both grammars: `{{ value }}`, `[[ flag ]]`, `<< model >>`.
+pub const MARKERS: [(&str, &str); 3] = [("{{", "}}"), ("[[", "]]"), ("<<", ">>")];
+
+/// Whitespace split that keeps placeholders (`MARKERS`) and `"quoted strings"` as one token.
 /// Quotes are stripped; a token containing whitespace is therefore a quoted string.
 fn split_tokens(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -120,7 +123,7 @@ fn split_tokens(line: &str) -> Vec<&str> {
                 continue;
             }
         }
-        for (open, close) in [("{{", "}}"), ("[[", "]]")] {
+        for (open, close) in MARKERS {
             if line[i..].starts_with(open) {
                 if let Some(end) = line[i..].find(close) {
                     out.push(&line[i..i + end + 2]);
@@ -186,7 +189,7 @@ pub fn lex_braces<'a>(text: &'a str) -> Vec<Node<'a>> {
             _ => {
                 if cur.is_empty() { cur_line = line; }
                 let start = i;
-                if let Some((_, close)) = [("{{", "}}"), ("[[", "]]")].iter().find(|(o, _)| text[i..].starts_with(o)) {
+                if let Some((_, close)) = MARKERS.iter().find(|(o, _)| text[i..].starts_with(o)) {
                     let end = text[i..].find(close).map(|e| i + e + 2).unwrap_or(b.len());
                     cur.push(&text[start..end]);
                     i = end;
@@ -228,7 +231,7 @@ mod tests {
 
     #[test]
     fn quotes_and_placeholders_are_single_tokens() {
-        assert_eq!(split_tokens(r#"description "to core" {{ x }} [[ f ]] y"#), vec!["description", "to core", "{{ x }}", "[[ f ]]", "y"]);
+        assert_eq!(split_tokens(r#"description "to core" {{ x }} [[ f ]] << m >> y"#), vec!["description", "to core", "{{ x }}", "[[ f ]]", "<< m >>", "y"]);
     }
 
     #[test]
@@ -242,5 +245,7 @@ mod tests {
         let nb = &nodes[1].children[0].children[0].children[0];
         assert_eq!(nb.tokens, vec!["neighbor", "10.1.0.1"]);
         assert_eq!(nb.children[1].tokens, vec!["description", "to peer one"]);
+        let t = lex_braces("bgp {\n    << groups >>\n}\n");
+        assert_eq!(t[0].children[0].tokens, vec!["<< groups >>"]);
     }
 }

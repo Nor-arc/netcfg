@@ -1,0 +1,5 @@
+# The Junos example set.
+set junos
+  dialect: junos
+  version: 2026.09.1
+  root: JunosDevice

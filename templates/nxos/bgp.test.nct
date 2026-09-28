@@ -1,0 +1,107 @@
+# Template tests for the NX-OS set: `netcfg test templates/nxos`.
+
+test "baseline device"
+  model: Device
+  config:
+    !Command: show running-config
+    version 9.3(8)
+    hostname leaf1
+    route-map RM-IN permit 10
+      match ip address prefix-list PL-1
+      set local-preference 200
+    route-map RM-IN deny 20
+    router bgp 65000
+      router-id 10.0.0.1
+      neighbor 10.1.0.1
+        remote-as 65001
+        ebgp-multihop 2
+        timers 10 30
+        address-family ipv4 unicast
+          route-map RM-IN in
+  expect:
+    hostname: leaf1
+    routeMaps:
+      - {name: RM-IN, action: permit, seq: 10, matchPrefixLists: [PL-1], setLocalPref: 200}
+      - {name: RM-IN, action: deny, seq: 20}
+    bgp:
+      - asn: 65000
+        routerId: 10.0.0.1
+        peerTemplates: []
+        neighbors:
+          - peer: 10.1.0.1
+            remoteAs: 65001
+            ebgpMultihop: 2
+            timers: {keepalive: 10, hold: 30}
+            addressFamilies:
+              - {afi: ipv4, safi: unicast, routeMapIn: RM-IN}
+  unmanaged:
+    - version 9.3(8)
+  roundtrip: true
+
+test "a value outside its range fails"
+  model: Neighbor
+  config:
+    neighbor 10.1.0.1
+      ebgp-multihop 999
+  fails: outside 2..255
+
+test "a duplicate neighbor fails"
+  model: Bgp
+  config:
+    router bgp 65000
+      neighbor 10.1.0.1
+      neighbor 10.1.0.1
+  fails: duplicate Neighbor
+
+test "an unknown sub-command is unmanaged"
+  model: Neighbor
+  config:
+    neighbor 10.1.0.1
+      remote-as 65001
+      bfd
+  unmanaged:
+    - neighbor 10.1.0.1 > bfd
+
+test "a header that does not decode is not ours"
+  model: Bgp
+  config:
+    router bgp 65000
+      neighbor 10.2.0.0/24
+        remote-as 65010
+  expect: {asn: 65000, peerTemplates: [], neighbors: []}
+  unmanaged:
+    - router bgp 65000 > neighbor 10.2.0.0/24 > remote-as 65010
+
+test "maximum-prefix with optional middle parts"
+  model: NeighborAf
+  config:
+    address-family ipv4 unicast
+      maximum-prefix 1000 80 restart 5
+  expect: {afi: ipv4, safi: unicast, maximumPrefix: {limit: 1000, threshold: 80, action: restart, restart: 5}}
+  roundtrip: true
+
+test "IPv6 neighbors are canonicalised"
+  model: Neighbor
+  config:
+    neighbor 2001:DB8:0:0:0:0:0:1
+      remote-as 65010
+  expect: {peer: "2001:db8::1", remoteAs: 65010}
+  render: |
+    neighbor 2001:db8::1
+      remote-as 65010
+
+test "asdot AS numbers read as asplain"
+  model: Neighbor
+  config:
+    neighbor 10.1.0.1
+      remote-as 1.10
+  expect: {peer: 10.1.0.1, remoteAs: 65546}
+
+test "the PeerSession fragment works in peer templates"
+  model: PeerTemplate
+  config:
+    template peer SPINE
+      remote-as 65100
+      update-source loopback0
+  expect: {name: SPINE, remoteAs: 65100, updateSource: loopback0}
+  roundtrip: true

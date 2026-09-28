@@ -1,0 +1,6 @@
+version 9.3(8)
+feature bgp
+router bgp 65000 > neighbor 10.1.0.1 > bfd
+router bgp 65000 > neighbor 10.1.0.1 > password 3 a667d47acc18ea6b
+router bgp 65000 > neighbor 10.1.0.2 > bfd
+router bgp 65000 > neighbor 10.1.0.2 > password 3 b9c2e1f07d3a5c44

@@ -1,0 +1,100 @@
+# Template tests for the EOS set: `netcfg test templates/eos`.
+
+test "neighbor with maximum-routes"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 remote-as 65431
+    neighbor 1.1.1.1 maximum-routes 1200 warning-only
+  expect:
+    peer: 1.1.1.1
+    remoteAs: 65431
+    maximumRoutes: {limit: 1200, action: warning-only}
+  roundtrip: true
+
+test "unknown modifier fails"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 maximum-routes 1200 loudly
+  fails: starts like a managed line
+
+test "password is ignored"
+  model: EosNeighbor
+  config:
+    neighbor 1.1.1.1 remote-as 1
+    neighbor 1.1.1.1 password 7 abc
+  unmanaged:
+    - neighbor 1.1.1.1 password 7 abc
+
+test "flat groups collect lines per neighbor"
+  model: EosDevice
+  config:
+    hostname leaf1
+    router bgp 65000
+       router-id 10.0.0.1
+       neighbor 10.1.0.1 remote-as 65001
+       neighbor 10.1.0.1 description to spine-1
+       neighbor 10.1.0.2 remote-as 65002
+       neighbor 10.1.0.1 send-community
+       neighbor 10.1.0.2 shutdown
+  expect:
+    hostname: leaf1
+    routeMaps: []
+    bgp:
+      - asn: 65000
+        routerId: 10.0.0.1
+        neighbors:
+          - {peer: 10.1.0.1, remoteAs: 65001, description: to spine-1, sendCommunity: true}
+          - {peer: 10.1.0.2, remoteAs: 65002, shutdown: true}
+  render: |
+    hostname leaf1
+    router bgp 65000
+       router-id 10.0.0.1
+       neighbor 10.1.0.1 remote-as 65001
+       neighbor 10.1.0.1 description to spine-1
+       neighbor 10.1.0.1 send-community
+       neighbor 10.1.0.2 remote-as 65002
+       neighbor 10.1.0.2 shutdown
+
+test "a repeated value line is an error"
+  model: EosDevice
+  config:
+    hostname leaf1
+    router bgp 65000
+       neighbor 10.1.0.1 remote-as 65001
+       neighbor 10.1.0.1 remote-as 65009
+  fails: matched twice
+
+test "an unknown line about an unknown neighbor conjures up nothing"
+  model: EosDevice
+  config:
+    hostname leaf1
+    router bgp 65000
+       neighbor 10.1.0.9 bfd
+  expect:
+    hostname: leaf1
+    routeMaps: []
+    bgp: [{asn: 65000, neighbors: []}]
+  unmanaged:
+    - router bgp 65000 > neighbor 10.1.0.9 bfd
+
+test "negated value lines are null"
+  model: EosNeighbor
+  config:
+    neighbor 10.0.0.1 remote-as 65001
+    no neighbor 10.0.0.1 description
+  expect: {peer: 10.0.0.1, remoteAs: 65001, description: null}
+  roundtrip: true
+
+test "a negated value line carrying a value is unrepresentable"
+  model: EosNeighbor
+  config:
+    neighbor 10.0.0.1 remote-as 65001
+    no neighbor 10.0.0.1 remote-as 65001
+  fails: starts like a managed line
+
+test "timers are a struct"
+  model: EosNeighbor
+  config:
+    neighbor 10.0.0.1 timers 10 30
+  expect: {peer: 10.0.0.1, timers: {keepalive: 10, hold: 30}}
+  roundtrip: true

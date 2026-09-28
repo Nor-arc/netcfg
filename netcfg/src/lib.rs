@@ -1,21 +1,29 @@
 //! Bidirectional network-config templates.
 //!
-//! A `.ttp` file declares a model (typed fields) and a config-shaped template. The same
+//! A `.nct` file declares models (typed fields) and config-shaped templates. The same
 //! template parses a device's running config into a value and renders a value back to
 //! config. Matching is strict: a line that starts like a managed line but doesn't match is
 //! an error unless the template opts out with `@ignore`.
 
 pub mod dialect;
+pub mod diff;
 pub mod engine;
+pub mod golden;
+pub mod fmt;
 pub mod lexer;
+pub mod lint;
 pub mod model;
 pub mod schema;
+pub mod set;
+pub mod skeleton;
+pub mod suggest;
 pub mod template;
+pub mod testfile;
 pub mod types;
 pub mod value;
 
 pub use dialect::Dialect;
-pub use engine::{Engine, Parsed};
+pub use engine::{Engine, Parsed, RenderMode, ENGINE_VERSION};
 pub use lexer::Node;
 pub use value::{Record, Value};
 

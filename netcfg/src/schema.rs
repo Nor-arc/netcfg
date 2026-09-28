@@ -15,7 +15,7 @@ impl Engine {
         while let Some(m) = todo.pop() {
             if defs.contains_key(&m.name) { continue; }
             defs.insert(m.name.clone(), self.model_schema(m));
-            for f in m.fields.iter().filter(|f| f.kind == Kind::Many) {
+            for f in m.fields.iter().filter(|f| f.kind.is_nested()) {
                 if let Some(sub) = self.model(&f.type_spec) { todo.push(sub); }
             }
         }
@@ -33,6 +33,7 @@ impl Engine {
             let s = match f.kind {
                 Kind::Flag => json!({"type": "boolean", "default": f.default.as_ref().map(|d| d[0] == "true").unwrap_or(false)}),
                 Kind::Many => json!({"type": "array", "items": {"$ref": format!("#/$defs/{}", f.type_spec)}}),
+                Kind::Single { .. } => json!({"$ref": format!("#/$defs/{}", f.type_spec)}),
                 _ => {
                     let mut s = m.field_type(i).map(|t| t.schema()).unwrap_or(json!({}));
                     if let (Some(d), Some(o)) = (&f.default, s.as_object_mut()) {
@@ -45,9 +46,15 @@ impl Engine {
                     s
                 }
             };
+            let s = match (&f.doc, s) {
+                (Some(doc), J::Object(mut o)) => { o.insert("description".into(), J::String(doc.clone())); J::Object(o) }
+                (_, s) => s,
+            };
             props.insert(f.name.clone(), s);
-            if matches!(f.kind, Kind::Key | Kind::Scalar) && f.default.is_none() { required.push(J::String(f.name.clone())); }
+            if matches!(f.kind, Kind::Key | Kind::Scalar | Kind::Single { required: true }) && f.default.is_none() { required.push(J::String(f.name.clone())); }
         }
-        json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+        let mut out = json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
+        if let Some(doc) = &m.doc { out["description"] = J::String(doc.clone()); }
+        out
     }
 }

@@ -1,3 +1,4 @@
+# Shared by the NX-OS and EOS sets (their manifests include it).
 # Route-map entries. Identity is (name, seq); the action is an ordinary value on the
 # header line, so permit -> deny is an edit rather than a delete + add.
 
@@ -12,16 +13,16 @@ model RouteMapEntry
   action: action
   seq: key int
   description: phrase?
-  matchPrefixLists: names?
+  matchPrefixLists: list(string)?
   matchAcl: string?
   matchCommunity: communityMatch?
   matchAsPath: string?
   setLocalPref: int?
   setMetric: int?
-  setCommunity: names?
+  setCommunity: list(string)?
   prependAsPath: list(prependItem)?
 
-template
+template RouteMapEntry
   route-map {{ name }} {{ action }} {{ seq }}
     description {{ description }}
     match ip address prefix-list {{ matchPrefixLists }}

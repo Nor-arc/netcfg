@@ -16,7 +16,7 @@ model NeighborAf
   nextHopSelf: flag
   softReconfigInbound: flag
 
-template
+template NeighborAf
   address-family {{ afi }} {{ safi }}
     send-community [[ sendCommunity ]]
     send-community extended [[ sendCommunityExtended ]]
@@ -26,41 +26,43 @@ template
     next-hop-self [[ nextHopSelf ]]
     soft-reconfiguration inbound [[ softReconfigInbound ]]
 
+# Session settings shared by neighbors and peer templates.
+fragment PeerSession
+  description: phrase?
+  updateSource: string?          # interface the session is sourced from
+  ebgpMultihop: int(2..255)?
+
+template PeerSession
+  description {{ description }}
+  update-source {{ updateSource }}
+  ebgp-multihop {{ ebgpMultihop }}
+
+# A BGP neighbor block.
 model Neighbor
   peer: key ip
-  remoteAs: asn?
+  remoteAs: asn?                 # peer's AS; may be inherited from a peer template
   inheritPeer: string?
-  description: phrase?
-  updateSource: string?
-  ebgpMultihop: int(2..255)?
-  timers: intpair?
+  timers: {{ keepalive: int }} {{ hold: int }}?
   shutdown: flag
   addressFamilies: [NeighborAf]
 
-template
+template Neighbor
   neighbor {{ peer }}
     remote-as {{ remoteAs }}
     inherit peer {{ inheritPeer }}
-    description {{ description }}
-    update-source {{ updateSource }}
-    ebgp-multihop {{ ebgpMultihop }}
+    << @PeerSession >>
     timers {{ timers }}
     shutdown [[ shutdown ]]
-    {{ addressFamilies }}
+    << addressFamilies >>
 
 model PeerTemplate
   name: key string
   remoteAs: asn?
-  description: phrase?
-  updateSource: string?
-  ebgpMultihop: int(2..255)?
 
-template
+template PeerTemplate
   template peer {{ name }}
     remote-as {{ remoteAs }}
-    description {{ description }}
-    update-source {{ updateSource }}
-    ebgp-multihop {{ ebgpMultihop }}
+    << @PeerSession >>
 
 model Bgp
   asn: key asn
@@ -69,19 +71,19 @@ model Bgp
   peerTemplates: [PeerTemplate]
   neighbors: [Neighbor]
 
-template
+template Bgp
   router bgp {{ asn }}
     router-id {{ routerId }}
     log-neighbor-changes [[ logNeighborChanges ]]
-    {{ peerTemplates }}
-    {{ neighbors }}
+    << peerTemplates >>
+    << neighbors >>
 
 model Device
   hostname: string
   routeMaps: [RouteMapEntry]
   bgp: [Bgp]
 
-template
+template Device
   hostname {{ hostname }}
-  {{ routeMaps }}
-  {{ bgp }}
+  << routeMaps >>
+  << bgp >>

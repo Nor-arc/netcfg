@@ -4,7 +4,7 @@ model Vlan
   id: key vlanId
   name: string?
 
-template
+template Vlan
   vlan {{ id }}
    name {{ name }}
 
@@ -16,7 +16,7 @@ model Interface
   accessVlan: vlanId?
   shutdown: flag
 
-template
+template Interface
   interface {{ name }}
    description {{ description }}
    ip address {{ address }}
@@ -30,17 +30,40 @@ model StaticRoute
   prefix: key cidr
   nextHop: key ipv4
 
-template
+template StaticRoute
   ip route {{ prefix }} {{ nextHop }}
+
+type aclAction = "permit" | "deny"
+
+# One access-control entry. It has no key: its identity is its position in the list.
+model AclEntry
+  action: aclAction
+  match: phrase           # protocol, source, destination and options as written
+
+template AclEntry
+  {{ action }} {{ match }}
+
+model Acl
+  name: key string
+  entries: [AclEntry] ordered
+
+template Acl
+  ip access-list extended {{ name }}
+   << entries >>
+   @ignore remark
 
 model Device
   hostname: string
   vlans: [Vlan]
   interfaces: [Interface]
   routes: [StaticRoute]
+  acls: [Acl]
+  bgp: IosBgp?
 
-template
+template Device
   hostname {{ hostname }}
-  {{ vlans }}
-  {{ interfaces }}
-  {{ routes }}
+  << vlans >>
+  << interfaces >>
+  << routes >>
+  << acls >>
+  << bgp >>

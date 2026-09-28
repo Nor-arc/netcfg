@@ -1,4 +1,5 @@
-//! Template text: config-shaped lines with `{{ field }}` placeholders and `@ignore` lines.
+//! Template text: config-shaped lines with `{{ value }}`, `[[ flag ]]` and `<< model >>`
+//! placeholders, and `@ignore` lines.
 //! Parsing and validation are pure functions over the model's field declarations, so the
 //! loader, the CLI validator and a language server all agree on what a valid template is.
 
@@ -12,6 +13,10 @@ pub enum Tok {
     Hole(String),
     /// `[[ field ]]`: consumes nothing; the line's presence is the flag's value.
     Flag(String),
+    /// `<< field >>`: whole statements/blocks of a nested model at this level.
+    Nest(String),
+    /// `<< @Fragment >>`: the fragment's lines, spliced in at load.
+    Include(String),
 }
 
 #[derive(Debug, Clone)]
@@ -21,18 +26,31 @@ pub struct TLine {
     pub line: usize,
     pub children: Vec<TLine>,
     pub ignore: bool,
+    /// The fragment this line was spliced from, if any (for error messages).
+    pub origin: Option<String>,
 }
 
 impl TLine {
-    /// Every bound field name, `{{ }}` and `[[ ]]` alike.
+    /// Every bound field name, `{{ }}`, `[[ ]]` and `<< >>` alike.
     pub fn holes(&self) -> Vec<&str> {
-        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) | Tok::Flag(n) => Some(n.as_str()), _ => None }).collect()
+        self.toks.iter().filter_map(|t| match t { Tok::Hole(n) | Tok::Flag(n) | Tok::Nest(n) => Some(n.as_str()), _ => None }).collect()
     }
     pub fn lits(&self) -> Vec<String> {
         self.toks.iter().filter_map(|t| match t { Tok::Lit(s) => Some(s.clone()), _ => None }).collect()
     }
     pub fn text(&self) -> String {
-        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]") }).collect::<Vec<_>>().join(" ")
+        self.toks.iter().map(|t| match t { Tok::Lit(s) => s.clone(), Tok::Hole(n) => format!("{{{{ {n} }}}}"), Tok::Flag(n) => format!("[[ {n} ]]"), Tok::Nest(n) => format!("<< {n} >>"), Tok::Include(n) => format!("<< @{n} >>") }).collect::<Vec<_>>().join(" ")
+    }
+    /// Where the line is, for messages: `template line 12`, or `fragment Common line 3`.
+    pub fn at(&self) -> String {
+        match &self.origin {
+            Some(f) => format!("fragment {f} line {}", self.line),
+            None => format!("template line {}", self.line),
+        }
+    }
+    /// The fragment named by a `<< @Name >>` line.
+    pub fn include(&self) -> Option<&str> {
+        match self.toks.as_slice() { [Tok::Include(n)] => Some(n), _ => None }
     }
 }
 
@@ -55,20 +73,28 @@ pub fn from_nodes(nodes: &[crate::lexer::Node<'_>], first_line: usize) -> Result
         if n.tokens.first() == Some(&"@ignore") {
             if n.tokens.len() == 1 { errors.push(format!("template line {line}: `@ignore` needs at least one word")); }
             if !n.children.is_empty() { errors.push(format!("template line {line}: `@ignore` lines cannot have children")); }
-            return TLine { toks: n.tokens[1..].iter().map(|s| Tok::Lit(s.to_string())).collect(), line, children: Vec::new(), ignore: true };
+            return TLine { toks: n.tokens[1..].iter().map(|s| Tok::Lit(s.to_string())).collect(), line, children: Vec::new(), ignore: true, origin: None };
         }
         let toks = n.tokens.iter().map(|w| {
             if let Some(inner) = w.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
                 Tok::Hole(inner.trim().to_string())
             } else if let Some(inner) = w.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
                 Tok::Flag(inner.trim().to_string())
+            } else if let Some(inner) = w.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+                match inner.trim().strip_prefix('@') {
+                    Some(frag) => {
+                        if n.tokens.len() != 1 || !n.children.is_empty() { errors.push(format!("template line {line}: << @{frag} >> must be alone on its line")); }
+                        Tok::Include(frag.trim().to_string())
+                    }
+                    None => Tok::Nest(inner.trim().to_string()),
+                }
             } else {
-                if w.contains("{{") || w.contains("}}") || w.contains("[[") || w.contains("]]") { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value) or [[ name ]] (flag)")); }
+                if ["{{", "}}", "[[", "]]", "<<", ">>"].iter().any(|m| w.contains(m)) { errors.push(format!("template line {line}: placeholder in `{w}` must be written {{{{ name }}}} (value), [[ name ]] (flag) or << name >> (nested model)")); }
                 Tok::Lit(w.to_string())
             }
         }).collect();
         let children = n.children.iter().map(|c| conv(c, first_line, errors)).collect();
-        TLine { toks, line, children, ignore: false }
+        TLine { toks, line, children, ignore: false, origin: None }
     }
     let lines: Vec<TLine> = nodes.iter().map(|n| conv(n, first_line, &mut errors)).collect();
     if errors.is_empty() { Ok(lines) } else { Err(errors) }
@@ -100,6 +126,13 @@ pub fn shape(lines: &[TLine], keys: &[&str]) -> Result<Shape, String> {
         }
         _ => Ok(Shape::Flat { lines: content, ignores: top_ignores }),
     }
+}
+
+/// A constant line: a leaf with no placeholders except (in a flat group) the key ones. It must
+/// be present, produces no data, and is always rendered.
+pub fn is_constant(l: &TLine, keys: &[&str]) -> bool {
+    !l.ignore && l.children.is_empty() && l.holes().iter().all(|h| keys.contains(h))
+        && l.toks.iter().all(|t| matches!(t, Tok::Lit(_) | Tok::Hole(_)))
 }
 
 /// `rest_of_line(type_spec)` tells whether a field's type consumes the rest of the line.
@@ -137,7 +170,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     fn all<'a>(ls: &'a [TLine], out: &mut Vec<&'a TLine>) { for l in ls { out.push(l); all(&l.children, out); } }
     let mut every: Vec<&TLine> = Vec::new();
     all(lines, &mut every);
-    let err = |errs: &mut Vec<String>, l: &TLine, msg: String| errs.push(format!("template line {} `{}`: {msg}", l.line, l.text()));
+    let err = |errs: &mut Vec<String>, l: &TLine, msg: String| errs.push(format!("{} `{}`: {msg}", l.at(), l.text()));
 
     for l in &every {
         for h in l.holes() {
@@ -187,7 +220,7 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     fn check_body_line(errs: &mut Vec<String>, l: &TLine, allow_keys: bool, allow_containers: bool, check_value_line: &dyn Fn(&mut Vec<String>, &TLine, bool)) {
         if !l.children.is_empty() && l.holes().is_empty() {
             if !allow_containers {
-                errs.push(format!("template line {} `{}`: a flat group line cannot have nested lines", l.line, l.text()));
+                errs.push(format!("{} `{}`: a flat group line cannot have nested lines", l.at(), l.text()));
                 return;
             }
             for c in l.children.iter().filter(|c| !c.ignore) { check_body_line(errs, c, allow_keys, true, check_value_line); }
@@ -197,19 +230,31 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
     }
     let check_value_line = |errs: &mut Vec<String>, l: &TLine, allow_keys: bool| {
         let metas: Vec<&FieldDef> = l.holes().into_iter().filter_map(by_name).collect();
-        if l.holes().is_empty() { err(errs, l, "line binds no field".into()); }
+        // Nothing but literals (and, in a flat group, the key): a constant line.
+        if is_constant(l, &keys) && (allow_keys || l.holes().is_empty()) { return; }
         if !l.children.is_empty() { err(errs, l, "a line with placeholders cannot have nested lines; model the block as its own keyed type".into()); }
         if !allow_keys {
             for k in l.holes() { if keys.contains(&k) { err(errs, l, format!("Key field `{k}` belongs on the header line")); } }
         }
-        if let Some(m) = metas.iter().find(|m| m.kind == Kind::Many) {
-            if l.toks.len() != 1 { err(errs, l, format!("collection `{{{{ {} }}}}` must be alone on its line", m.name)); }
-        }
         for t in &l.toks {
+            let kind = |n: &str| by_name(n).map(|f| f.kind);
             match t {
-                Tok::Hole(n) => if by_name(n).map(|f| f.kind == Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is a flag: write it as [[ {n} ]] (the line's presence), not {{{{ {n} }}}} (a value)")); },
-                Tok::Flag(n) => if by_name(n).map(|f| f.kind != Kind::Flag).unwrap_or(false) { err(errs, l, format!("`{n}` is not a flag: [[ ]] is for flags; a value is written {{{{ {n} }}}}")); },
-                _ => {}
+                Tok::Hole(n) => match kind(n) {
+                    Some(Kind::Flag) => err(errs, l, format!("`{n}` is a flag: write it as [[ {n} ]] (the line's presence), not {{{{ {n} }}}} (a value)")),
+                    Some(k) if k.is_nested() => err(errs, l, format!("`{n}` is a nested model: write it as << {n} >> alone on its line, not {{{{ {n} }}}} (a value)")),
+                    _ => {}
+                },
+                Tok::Flag(n) => match kind(n) {
+                    Some(k) if k.is_nested() => err(errs, l, format!("`{n}` is a nested model: write it as << {n} >> alone on its line, not [[ {n} ]] (a flag)")),
+                    Some(k) if k != Kind::Flag => err(errs, l, format!("`{n}` is not a flag: [[ ]] is for flags; a value is written {{{{ {n} }}}}")),
+                    _ => {}
+                },
+                Tok::Nest(n) => match kind(n) {
+                    Some(Kind::Flag) => err(errs, l, format!("`{n}` is a flag, not a nested model: write it as [[ {n} ]]")),
+                    Some(k) if !k.is_nested() => err(errs, l, format!("`{n}` is a value, not a nested model: << >> is for [Model] and Model? fields; a value is written {{{{ {n} }}}}")),
+                    _ => if l.toks.len() != 1 { err(errs, l, format!("<< {n} >> must be alone on its line")); },
+                },
+                Tok::Lit(_) | Tok::Include(_) => {}
             }
         }
         if let Some(m) = metas.iter().find(|m| m.kind == Kind::Flag) {
@@ -242,12 +287,16 @@ pub fn validate(type_name: &str, lines: &[TLine], fields: &[FieldDef], rest_of_l
         Ok(Shape::Flat { lines: flat, .. }) => {
             for l in &flat {
                 if absent_spelling_of(l, negation, fields).is_some() || negated_flag_line(l, negation, fields).is_some() { err(&mut errs, l, "negated spellings are not supported in flat groups yet".into()); continue; }
+                if is_constant(l, &keys) && negation.is_some() && l.toks.first() == negation.map(|n| Tok::Lit(n.to_string())).as_ref() {
+                    err(&mut errs, l, "a constant line in a flat group cannot start with the negation word; write it in a block body, or model it as a flag".into());
+                    continue;
+                }
                 let ks: Vec<&str> = l.holes().into_iter().filter(|h| keys.contains(h)).collect();
                 if ks != keys { err(&mut errs, l, format!("every line of a flat group must carry all Key fields in the same order ({})", keys.join(", "))); }
                 let first_value = l.toks.iter().position(|t| matches!(t, Tok::Hole(n) | Tok::Flag(n) if by_name(n).map(|f| f.kind != Kind::Key).unwrap_or(false)));
                 let last_key = l.toks.iter().rposition(|t| matches!(t, Tok::Hole(n) if keys.contains(&n.as_str())));
                 if let (Some(fv), Some(lk)) = (first_value, last_key) { if lk > fv { err(&mut errs, l, "Key placeholders must come before value placeholders".into()); } }
-                if l.holes().into_iter().filter_map(by_name).any(|m| m.kind == Kind::Many) { err(&mut errs, l, "a flat group line cannot hold a collection".into()); }
+                if l.holes().into_iter().filter_map(by_name).any(|m| m.kind.is_nested()) { err(&mut errs, l, "a flat group line cannot hold a nested model".into()); }
                 check_body_line(&mut errs, l, true, false, &check_value_line);
             }
         }

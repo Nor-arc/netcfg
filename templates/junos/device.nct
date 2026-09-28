@@ -7,7 +7,7 @@ model JunosInterface
   description: phrase?
   address: cidr?
 
-template
+template JunosInterface
   {{ name }} {
       description {{ description }};
       unit 0 {
@@ -22,7 +22,7 @@ model JunosNeighbor
   description: phrase?
   peerAs: asn?
 
-template
+template JunosNeighbor
   neighbor {{ peer }} {
       description {{ description }};
       peer-as {{ peerAs }};
@@ -35,10 +35,10 @@ model JunosGroup
   type: peerType?
   neighbors: [JunosNeighbor]
 
-template
+template JunosGroup
   group {{ name }} {
       type {{ type }};
-      {{ neighbors }}
+      << neighbors >>
   }
 
 model JunosDevice
@@ -47,7 +47,7 @@ model JunosDevice
   interfaces: [JunosInterface]
   groups: [JunosGroup]
 
-template
+template JunosDevice
   system {
       host-name {{ hostname }};
       services {
@@ -55,10 +55,10 @@ template
       }
   }
   interfaces {
-      {{ interfaces }}
+      << interfaces >>
   }
   protocols {
       bgp {
-          {{ groups }}
+          << groups >>
       }
   }
